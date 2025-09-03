@@ -6,6 +6,11 @@ make
 # or: gcc -shared -fPIC -O2 -Wall -Wextra -o libi2c_redirect.so i2c_redirect.c -ldl
 ```
 
+Cross-compile for aarch64 (requires `aarch64-linux-gnu-gcc` on PATH):
+```bash
+make CROSS_COMPILE=aarch64-linux-gnu-
+```
+
 Run (tee mode):
 ```bash
 export I2C_PROXY_SOCK=/tmp/i2c.tap.sock

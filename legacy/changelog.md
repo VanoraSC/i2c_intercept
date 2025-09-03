@@ -1,5 +1,12 @@
 # I2C Intercept - Changelog
 
+## Version 0.0.7
+
+- Read the full 62-byte response from the TTY before returning data to the caller.
+  This prevents leftover bytes from accumulating in the TTY buffer, which would
+  eventually misalign subsequent reads and cause failures during long-running
+  operations.
+
 ## Version 0.0.6
 
 - Fix I2C_INTERCEPT_ADDR_BYPASS feature, and it is now fully functional.

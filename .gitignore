@@ -1,2 +1,3 @@
 c_preload_lib/libi2c_redirect.so
 i2c_tap_server/target
+i2c_time_writer/target

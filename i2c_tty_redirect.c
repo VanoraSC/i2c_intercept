@@ -7,6 +7,7 @@
 #include <termios.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <pthread.h>
 
 #define TTY_PATH "/dev/ttyS22"
 #define DEFAULT_SOCK_PATH "/tmp/i2c.tap.sock"
@@ -80,10 +81,12 @@ static void forward_write(int tty_fd, int addr, const char *hex) {
     if (!redirect_addr[addr]) return;
     unsigned char buf[4096];
     size_t data_len;
-    hex2bin(hex, buf+2, &data_len);
+    hex2bin(hex, buf+3, &data_len);
+    if (data_len > 255) data_len = 255;
     buf[0] = (unsigned char)addr;
     buf[1] = 0; // write command
-    ssize_t w = write(tty_fd, buf, data_len + 2);
+    buf[2] = (unsigned char)data_len;
+    ssize_t w = write(tty_fd, buf, data_len + 3);
     (void)w;
 }
 
@@ -91,11 +94,67 @@ static void forward_read(int tty_fd, int addr, const char *hex) {
     if (!redirect_addr[addr]) return;
     unsigned char buf[4096];
     size_t data_len;
-    hex2bin(hex, buf+2, &data_len);
+    hex2bin(hex, buf+3, &data_len);
+    if (data_len > 255) data_len = 255;
     buf[0] = (unsigned char)addr;
     buf[1] = 1; // read command
-    ssize_t w = write(tty_fd, buf, data_len + 2);
+    buf[2] = (unsigned char)data_len;
+    ssize_t w = write(tty_fd, buf, data_len + 3);
     (void)w;
+}
+
+static void bin2hex(const unsigned char *in, size_t len, char *out) {
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        out[i*2] = hex[(in[i] >> 4) & 0xF];
+        out[i*2 + 1] = hex[in[i] & 0xF];
+    }
+    out[len*2] = '\0';
+}
+
+static ssize_t read_full(int fd, unsigned char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = read(fd, buf + off, len - off);
+        if (n <= 0) return -1;
+        off += (size_t)n;
+    }
+    return (ssize_t)off;
+}
+
+struct relay_arg {
+    int tty_fd;
+    int sock_fd;
+};
+
+static void *relay_tty_to_sock(void *arg) {
+    struct relay_arg *a = (struct relay_arg *)arg;
+    unsigned char data[256];
+    unsigned char hdr[3];
+    char hex[512];
+    char line[1024];
+    while (1) {
+        if (read_full(a->tty_fd, hdr, 3) < 0) break;
+        int addr = hdr[0];
+        int cmd = hdr[1];
+        int len = hdr[2];
+        if (len < 0 || len > 255) break;
+        if (read_full(a->tty_fd, data, (size_t)len) < 0) break;
+        if (!redirect_addr[addr]) continue;
+        bin2hex(data, (size_t)len, hex);
+        int n = snprintf(line, sizeof(line),
+                         "{\"type\":\"%s\",\"addr\":%d,\"len\":%d,\"data_hex\":\"%s\"}\n",
+                         cmd ? "read" : "write", addr, len, hex);
+        if (n > 0 && n < (int)sizeof(line)) {
+            ssize_t off = 0;
+            while (off < n) {
+                ssize_t w = write(a->sock_fd, line + off, (size_t)(n - off));
+                if (w <= 0) break;
+                off += w;
+            }
+        }
+    }
+    return NULL;
 }
 
 int main(void) {
@@ -110,6 +169,12 @@ int main(void) {
     int tty_fd = open_tty();
     if (tty_fd < 0) {
         perror("open tty");
+        return 1;
+    }
+    struct relay_arg arg = { tty_fd, sock_fd };
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, relay_tty_to_sock, &arg) != 0) {
+        perror("pthread_create");
         return 1;
     }
     FILE *fp = fdopen(sock_fd, "r");
@@ -143,6 +208,8 @@ int main(void) {
             forward_read(tty_fd, addr, h);
         }
     }
+    pthread_cancel(tid);
+    pthread_join(tid, NULL);
     close(tty_fd);
     close(sock_fd);
     return 0;

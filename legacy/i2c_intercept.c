@@ -7,7 +7,7 @@
 
 #include "util.h"
 
-#define VERSION "0.0.6"  // ❗️ Version of this library. Please update this when you make changes. ❗️
+#define VERSION "0.0.7"  // ❗️ Version of this library. Please update this when you make changes. ❗️
 
 uint8_t   bypassed_addrs[128] = {0};
 const int I2C_ADDR_MAX        = 127;  // Maximum valid 7-bit I2C address
@@ -374,23 +374,38 @@ ssize_t read(int fd, void *buf, size_t count) {
                 return -1;
             }
 
-            // Now read the response message from the TTY device. Per the configuration when we opened the TTY,
-            // we expect 62 bytes back (what's defined in the I2C Slice protocol), and will time out
-            // after 100 ms (that's the lowest possible timeout).
-            ssize_t read_bytes = real_read(tty_fd, buf, count);
-            pthread_mutex_unlock(&tty_mutex);
-            if (read_bytes < 0) {
-                print_error("Failed to read from TTY device\n");
-                errno = EIO;  // Input/output error
-                return -1;
-            }
+            // Now read the full response message from the TTY device. Per the configuration when we
+            // opened the TTY, we expect 62 bytes back (defined by the I2C Slice protocol), and will
+            // time out after 100 ms (that's the lowest possible timeout). Previously, we attempted
+            // to read only the caller-requested number of bytes. If the TTY sent more than that,
+            // leftover bytes would remain in the TTY buffer, causing subsequent reads to become
+            // misaligned and eventually fail. To avoid this, read all expected bytes and then return
+            // only the portion requested by the caller.
 
-            print_debug("Read %zd bytes from TTY device\n", read_bytes);
+            const size_t RESP_LEN = 62;  // expected response length from TTY
+            unsigned char resp_buf[RESP_LEN];
+            size_t total_read = 0;
+            while (total_read < RESP_LEN) {
+                ssize_t n = real_read(tty_fd, resp_buf + total_read, RESP_LEN - total_read);
+                if (n <= 0) {
+                    pthread_mutex_unlock(&tty_mutex);
+                    print_error("Failed to read from TTY device\n");
+                    errno = EIO;  // Input/output error
+                    return -1;
+                }
+                total_read += (size_t)n;
+            }
+            pthread_mutex_unlock(&tty_mutex);
+
+            size_t copy_len = count < RESP_LEN ? count : RESP_LEN;
+            memcpy(buf, resp_buf, copy_len);
+
+            print_debug("Read %zu bytes from TTY device (requested %zu)\n", total_read, count);
             if (log_level <= DEBUG) {
-                print_buffer((const unsigned char *)buf, read_bytes);
+                print_buffer((const unsigned char *)resp_buf, total_read);
                 printf("\n");
             }
-            return read_bytes;
+            return copy_len;
 
         } else {
             print_error("TTY device not available, cannot read from it\n");

@@ -7,6 +7,11 @@ use std::path::Path;
 use std::thread;
 use serde_json::Value;
 
+// Simple utility that accepts connections on a Unix domain socket and prints
+// any JSON lines it receives. It is primarily useful for debugging the output
+// of the I²C redirect library.
+
+/// Handle a single client connection by printing each line as JSON.
 fn handle_client(stream: UnixStream) -> io::Result<()> {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
@@ -26,11 +31,12 @@ fn handle_client(stream: UnixStream) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
+    // Determine socket path from CLI arg or environment.
     let sock_path = env::args().nth(1)
         .or_else(|| env::var("I2C_PROXY_SOCK").ok())
         .unwrap_or_else(|| "/tmp/i2c.tap.sock".into());
 
-    // Remove any stale socket path
+    // Remove any stale socket path to avoid bind errors.
     let p = Path::new(&sock_path);
     if p.exists() {
         let md = fs::symlink_metadata(&p)?;
@@ -43,6 +49,7 @@ fn main() -> io::Result<()> {
 
     println!("Listening on {}", sock_path);
 
+    // Accept connections and spawn a thread to handle each.
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {

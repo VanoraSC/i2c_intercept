@@ -1,4 +1,11 @@
-// i2c_redirect.c (Unix socket client)
+/*
+ * i2c_redirect.c
+ * ---------------
+ * LD_PRELOAD library that intercepts common I²C related syscalls and emits
+ * JSON descriptions of the traffic to a Unix domain socket. When the
+ * I2C_PROXY_PASSTHROUGH environment variable is unset, operations are
+ * swallowed after being logged so nothing touches the real hardware.
+ */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
@@ -32,16 +39,20 @@ static ssize_t (*real_write)(int, const void *, size_t) = NULL;
 static int (*real_ioctl)(int, unsigned long, ...) = NULL;
 static int (*real_close)(int) = NULL;
 
+/* Guard to avoid recursively intercepting our own syscalls. */
 static _Thread_local int in_hook = 0;
 
+/* Socket management state: either connect to a path or use an existing FD. */
 static int sock_fd = -1;
 static int sock_fd_from_env = -1;
 static char *sock_path = NULL;
-static int passthrough = 0;
+static int passthrough = 0; /* Whether to forward I²C operations. */
 
+/* Track which file descriptors correspond to I²C devices and current address. */
 static _Atomic int is_i2c_fd[FD_LIMIT];
 static _Atomic int current_addr[FD_LIMIT]; // -1 if unknown
 
+/* Resolve the real libc symbol addresses the first time we need them. */
 static void ensure_resolved(void) {
     if (real_open && real_open64 && real_openat && real_write && real_ioctl && real_close) return;
     real_open   = dlsym(RTLD_NEXT, "open");
@@ -52,12 +63,14 @@ static void ensure_resolved(void) {
     real_close  = dlsym(RTLD_NEXT, "close");
 }
 
+/* Return current time in nanoseconds. */
 static long long now_ns(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
+/* Encode a byte buffer as lower-case hex. */
 static void hex_encode(char *dst, const unsigned char *src, size_t n) {
     static const char *hex = "0123456789abcdef";
     for (size_t i = 0; i < n; i++) {
@@ -67,10 +80,12 @@ static void hex_encode(char *dst, const unsigned char *src, size_t n) {
     dst[2*n] = '\0';
 }
 
+/* Test if a path looks like an I²C device node. */
 static int is_i2c_path(const char *path) {
     return (path && strncmp(path, "/dev/i2c-", 9) == 0);
 }
 
+/* Record whether a file descriptor refers to an I²C device. */
 static void mark_i2c_fd(int fd, int yes) {
     if (fd >= 0 && fd < FD_LIMIT) {
         atomic_store(&is_i2c_fd[fd], yes ? 1 : 0);
@@ -78,12 +93,14 @@ static void mark_i2c_fd(int fd, int yes) {
     }
 }
 
+/* Query the mark applied by mark_i2c_fd. */
 static int is_marked_i2c(int fd) {
     if (fd >= 0 && fd < FD_LIMIT) return atomic_load(&is_i2c_fd[fd]) != 0;
     return 0;
 }
 
 // --- socket connect & send (with retry)
+/* Connect to the proxy Unix socket, returning the new fd or -1 on error. */
 static int connect_socket_path(const char *path) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
@@ -101,6 +118,7 @@ static int connect_socket_path(const char *path) {
     return fd;
 }
 
+/* Establish the global socket descriptor if not already connected. */
 static void ensure_socket(void) {
     if (sock_fd >= 0) return;
 
@@ -114,7 +132,10 @@ static void ensure_socket(void) {
     in_hook--;
 }
 
-// send all bytes; on EPIPE/ECONNRESET, try reconnect once
+/*
+ * Send len bytes, reconnecting once on EPIPE/ECONNRESET. If reconnection fails
+ * the data is silently dropped.
+ */
 static void send_all_or_drop(const char *buf, size_t len) {
     if (in_hook) return;
     if (sock_fd < 0) ensure_socket();
@@ -128,22 +149,23 @@ static void send_all_or_drop(const char *buf, size_t len) {
             continue;
         }
         if (n < 0 && (errno == EPIPE || errno == ECONNRESET)) {
-            // reconnect once
+            /* reconnect once */
             if (sock_fd_from_env < 0 && sock_path) {
                 close(sock_fd);
                 sock_fd = -1;
                 ensure_socket();
-                if (sock_fd < 0) return; // give up
-                continue; // retry loop
+                if (sock_fd < 0) return; /* give up */
+                continue; /* retry loop */
             } else {
-                return; // cannot reconnect fd-from-env
+                return; /* cannot reconnect fd-from-env */
             }
         } else {
-            return; // other error -> drop
+            return; /* other error -> drop */
         }
     }
 }
 
+/* Emit a line of JSON, appending a newline if needed. */
 static void emit_json_line(const char *s) {
     size_t len = strlen(s);
     if (len && s[len-1] == '\n') {
@@ -154,6 +176,7 @@ static void emit_json_line(const char *s) {
     }
 }
 
+/* printf-style helper that formats a JSON line and sends it. */
 static void emitf(const char *fmt, ...) __attribute__((format(printf,1,2)));
 static void emitf(const char *fmt, ...) {
     char buf[65536];
@@ -165,6 +188,7 @@ static void emitf(const char *fmt, ...) {
 }
 
 // --- init
+/* Constructor that initializes environment-derived settings. */
 __attribute__((constructor))
 static void init_i2c_redirect(void) {
     ensure_resolved();
@@ -183,6 +207,7 @@ static void init_i2c_redirect(void) {
 }
 
 // --- open family
+/* Common helper for open/open64/openat hooks. */
 static int handle_open_common(const char *path, int flags, mode_t *mode_opt, int which) {
     ensure_resolved();
     int fd = -1;
@@ -256,6 +281,7 @@ int close(int fd) {
 }
 
 // --- write
+/* Hook for the write syscall that logs data written to I²C descriptors. */
 ssize_t write(int fd, const void *buf, size_t count) {
     ensure_resolved();
     if (in_hook) return real_write(fd, buf, count);
@@ -283,6 +309,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
 }
 
 // --- ioctl
+/* Emit detailed information for the I2C_RDWR ioctl. */
 static void log_i2c_rdwr(int fd, struct i2c_rdwr_ioctl_data *d) {
     long long ts = now_ns();
     emitf("{\"type\":\"ioctl_rdwr\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"nmsgs\":%d,\"detail\":[",
@@ -307,6 +334,7 @@ static void log_i2c_rdwr(int fd, struct i2c_rdwr_ioctl_data *d) {
     emitf("]}");
 }
 
+/* Main ioctl hook that handles several I²C-specific requests. */
 int ioctl(int fd, unsigned long req, ...) {
     ensure_resolved();
     va_list ap;

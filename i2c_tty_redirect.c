@@ -1,3 +1,14 @@
+/*
+ * i2c_tty_redirect.c
+ * -------------------
+ * Utility that taps into the JSON stream produced by the I²C redirect
+ * library and forwards selected transactions to a serial TTY. Bytes coming
+ * back from the TTY are framed and written back to the socket so the proxy
+ * can simulate responses. All communication is framed as
+ *   [addr][cmd][len][data...]
+ * where `cmd` is 0 for a write and 1 for a read.
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,11 +20,19 @@
 #include <sys/un.h>
 #include <pthread.h>
 
+/* Serial device used for forwarding and default socket path to the proxy. */
 #define TTY_PATH "/dev/ttyS22"
 #define DEFAULT_SOCK_PATH "/tmp/i2c.tap.sock"
 
+/* Bitmap of which 7-bit I²C addresses should be forwarded. */
 static int redirect_addr[128];
 
+/*
+ * Parse the I2C_TTY_ADDRS environment variable which contains a comma
+ * separated list of decimal or hexadecimal addresses. Any address present is
+ * marked in the redirect_addr array so only traffic for those devices is
+ * forwarded to the serial line.
+ */
 static void parse_addr_env(void) {
     const char *env = getenv("I2C_TTY_ADDRS");
     if (!env || !*env) return;
@@ -30,6 +49,10 @@ static void parse_addr_env(void) {
     free(copy);
 }
 
+/*
+ * Open and configure the serial port. The port is set to 115200 baud and
+ * basic 8N1 settings with minimal processing so raw bytes can be transferred.
+ */
 static int open_tty(void) {
     int fd = open(TTY_PATH, O_RDWR | O_NOCTTY | O_SYNC);
     if (fd < 0) return -1;
@@ -47,12 +70,13 @@ static int open_tty(void) {
         tty.c_iflag &= ~(IXON | IXOFF | IXANY);
         tty.c_oflag &= ~OPOST;
         tty.c_cc[VMIN]  = 1;
-        tty.c_cc[VTIME] = 5; // 0.5s
+        tty.c_cc[VTIME] = 5; /* 0.5s timeout */
         tcsetattr(fd, TCSANOW, &tty);
     }
     return fd;
 }
 
+/* Connect to the JSON stream socket used by the I²C redirect library. */
 static int connect_socket(const char *path) {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -67,6 +91,7 @@ static int connect_socket(const char *path) {
     return fd;
 }
 
+/* Convert a hex string into bytes. */
 static void hex2bin(const char *hex, unsigned char *out, size_t *out_len) {
     size_t len = strlen(hex) / 2;
     for (size_t i=0;i<len;i++) {
@@ -77,6 +102,10 @@ static void hex2bin(const char *hex, unsigned char *out, size_t *out_len) {
     *out_len = len;
 }
 
+/*
+ * Frame a write command and push it to the serial port. The payload is
+ * prefixed by address, command byte and length.
+ */
 static void forward_write(int tty_fd, int addr, const char *hex) {
     if (!redirect_addr[addr]) return;
     unsigned char buf[4096];
@@ -84,12 +113,16 @@ static void forward_write(int tty_fd, int addr, const char *hex) {
     hex2bin(hex, buf+3, &data_len);
     if (data_len > 255) data_len = 255;
     buf[0] = (unsigned char)addr;
-    buf[1] = 0; // write command
+    buf[1] = 0; /* write command */
     buf[2] = (unsigned char)data_len;
     ssize_t w = write(tty_fd, buf, data_len + 3);
     (void)w;
 }
 
+/*
+ * Same as forward_write but marks the command as a read operation. This allows
+ * the serial side to distinguish the direction of the transfer.
+ */
 static void forward_read(int tty_fd, int addr, const char *hex) {
     if (!redirect_addr[addr]) return;
     unsigned char buf[4096];
@@ -97,12 +130,13 @@ static void forward_read(int tty_fd, int addr, const char *hex) {
     hex2bin(hex, buf+3, &data_len);
     if (data_len > 255) data_len = 255;
     buf[0] = (unsigned char)addr;
-    buf[1] = 1; // read command
+    buf[1] = 1; /* read command */
     buf[2] = (unsigned char)data_len;
     ssize_t w = write(tty_fd, buf, data_len + 3);
     (void)w;
 }
 
+/* Convert bytes to a hex string. Used when relaying data back to the socket. */
 static void bin2hex(const unsigned char *in, size_t len, char *out) {
     static const char hex[] = "0123456789abcdef";
     for (size_t i = 0; i < len; i++) {
@@ -112,6 +146,7 @@ static void bin2hex(const unsigned char *in, size_t len, char *out) {
     out[len*2] = '\0';
 }
 
+/* Read exactly len bytes from fd unless an error occurs. */
 static ssize_t read_full(int fd, unsigned char *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
@@ -127,6 +162,11 @@ struct relay_arg {
     int sock_fd;
 };
 
+/*
+ * Background thread that relays framed responses from the serial line back to
+ * the I²C proxy socket. Each frame read from the TTY is turned into a JSON
+ * line and written out so the proxy can feed it to interested clients.
+ */
 static void *relay_tty_to_sock(void *arg) {
     struct relay_arg *a = (struct relay_arg *)arg;
     unsigned char data[256];
@@ -157,6 +197,11 @@ static void *relay_tty_to_sock(void *arg) {
     return NULL;
 }
 
+/*
+ * Entry point: connect to the proxy socket, launch the relay thread and forward
+ * JSON messages describing I²C writes and reads to the serial port for any
+ * address flagged in redirect_addr.
+ */
 int main(void) {
     parse_addr_env();
     const char *sock_path = getenv("I2C_PROXY_SOCK");

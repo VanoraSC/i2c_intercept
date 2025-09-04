@@ -2,6 +2,8 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 
 /// Connect to `/dev/ttyS22`, log received messages, and optionally echo them
 /// back. When the `I2C_PROXY_RAW` environment variable is set to any value
@@ -18,9 +20,20 @@ fn main() -> io::Result<()> {
     // framed binary traffic and human readable text without recompilation.
     let raw_mode = env::var("I2C_PROXY_RAW").map_or(false, |v| v != "0");
 
-    // Open the device for reading and writing. We clone the handle so that the
-    // buffered reader does not interfere with writes.
-    let file = OpenOptions::new().read(true).write(true).open(&path)?;
+    // Open the device for reading and writing. If the path is not yet
+    // available, wait and retry until it appears. Cloning the resulting handle
+    // ensures the buffered reader does not interfere with writes.
+    let file = loop {
+        match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(f) => break f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                println!("Waiting for {:?} to become available...", path);
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    };
 
     if raw_mode {
         // In raw mode we operate on binary frames and echo them back verbatim.
@@ -34,7 +47,9 @@ fn main() -> io::Result<()> {
             // payload length. An unexpected EOF simply terminates the loop.
             let mut hdr = [0u8; 3];
             if let Err(e) = reader.read_exact(&mut hdr) {
-                if e.kind() != io::ErrorKind::UnexpectedEof { return Err(e); }
+                if e.kind() != io::ErrorKind::UnexpectedEof {
+                    return Err(e);
+                }
                 break;
             }
             let len = hdr[2] as usize;
@@ -67,7 +82,9 @@ fn main() -> io::Result<()> {
         // Process each line received from the device.
         for line in reader.lines() {
             let line = line?;
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
 
             println!("Received: {}", line);
 

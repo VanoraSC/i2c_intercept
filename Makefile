@@ -1,8 +1,9 @@
 # Top-level Makefile to build all components of the i2c_intercept project.
 #
-# The Makefile orchestrates compilation of the C preload library, the
-# i2c_tty_redirect utility and the Rust based tools.  It also exposes a
-# simple mechanism for cross compiling to aarch64 by setting `ARCH=aarch64`.
+# The Makefile orchestrates compilation of the C preload library and the
+# Rust based tools, including the I²C and TTY tap servers and the time writer.
+# It also exposes a simple mechanism for cross compiling to aarch64 by setting
+# `ARCH=aarch64`.
 # When cross compiling, an aarch64 cross toolchain and the matching Rust
 # target must be installed on the system.
 
@@ -44,10 +45,10 @@ CARGO_ENV := CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$(CARGO_TARGET_AARCH6
 endif
 
 # Phony targets prevent conflicts with files of the same name.
-.PHONY: all c_preload_lib i2c_tap_server i2c_time_writer clean
+.PHONY: all c_preload_lib i2c_tap_server i2c_time_writer tty_tap_server clean
 
 # Build everything by default.
-all: c_preload_lib i2c_tap_server i2c_time_writer
+all: c_preload_lib i2c_tap_server i2c_time_writer tty_tap_server
 
 # Build the C preload library by invoking its own Makefile and forwarding the
 # CROSS_COMPILE setting so it can also be cross compiled.
@@ -62,9 +63,14 @@ i2c_tap_server:
 i2c_time_writer:
 	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path i2c_time_writer/Cargo.toml
 
+# Build the Rust based TTY tap server.
+tty_tap_server:
+	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path tty_tap_server/Cargo.toml
+
 # Remove build artifacts from all sub projects so the repository returns to a
 # clean state.
 clean:
 	$(MAKE) -C c_preload_lib clean
 	cargo clean --manifest-path i2c_tap_server/Cargo.toml
 	cargo clean --manifest-path i2c_time_writer/Cargo.toml
+	cargo clean --manifest-path tty_tap_server/Cargo.toml

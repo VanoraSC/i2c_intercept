@@ -1,4 +1,4 @@
-use std::{env, fs::OpenOptions, io::Write, os::fd::AsRawFd, thread::sleep, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{env, fs::OpenOptions, io::{Read, Write}, os::fd::AsRawFd, thread::sleep, time::{Duration, SystemTime, UNIX_EPOCH}};
 use libc::c_ulong;
 
 // Constant from linux/i2c-dev.h used to select the target I²C slave.
@@ -30,12 +30,51 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // Every second, write the current timestamp to the device.
+    // Every second, write the current timestamp to the device and then read
+    // back a line of text. The companion tap server echoes the write and
+    // prefixes the original data with a monotonically increasing counter in the
+    // form "<counter>: <value>". Parsing this response allows us to verify both
+    // the data integrity and observe the counter for debugging purposes.
     loop {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let secs = now.as_secs();
         let data = secs.to_be_bytes();
+
+        // Send the current time to the I²C device.
         file.write_all(&data)?;
+
+        // Collect bytes from the device until a newline terminator is seen.
+        // The response is expected to be ASCII and follow the pattern
+        // "<counter>: <value>". Reading byte by byte keeps the logic simple and
+        // avoids buffering more than necessary.
+        let mut raw = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            // Read a single byte; if this fails the I²C transaction likely
+            // did not produce a response and the error will bubble up.
+            file.read_exact(&mut byte)?;
+            if byte[0] == b'\n' {
+                break;
+            }
+            raw.push(byte[0]);
+            // Guard against excessively long or malformed responses by
+            // capping the buffer size.
+            if raw.len() > 128 {
+                break;
+            }
+        }
+
+        let text = String::from_utf8_lossy(&raw);
+        if let Some((ctr, val)) = text.split_once(':') {
+            let counter = ctr.trim().parse::<u64>().unwrap_or(0);
+            let echoed = val.trim().parse::<u64>().unwrap_or(0);
+            println!("Read back: {} (counter {})", echoed, counter);
+        } else {
+            // If the response does not match the expected format, print the
+            // raw string so that developers can inspect the unexpected data.
+            println!("Read back (unparsed): {}", text.trim());
+        }
+
         sleep(Duration::from_secs(1));
     }
 }

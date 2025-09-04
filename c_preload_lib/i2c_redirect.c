@@ -56,6 +56,12 @@ static int passthrough = 0; /* Whether to forward I²C operations. */
  * PID is saved so the process can be terminated when the library unloads.
  */
 static pid_t socat_pid = -1;
+/*
+ * Copies of the TTY and socket paths used when spawning the socat helper.
+ * They are kept so the process can be restarted automatically if it exits.
+ */
+static char *socat_tty_path = NULL;
+static char *socat_socket_path = NULL;
 
 /* Track which file descriptors correspond to I²C devices and current address. */
 static _Atomic int is_i2c_fd[FD_LIMIT];
@@ -127,6 +133,56 @@ static int connect_socket_path(const char *path) {
     return fd;
 }
 
+/*
+ * Spawn the socat helper that bridges the configured TTY to a Unix domain
+ * socket.  The helper uses the path information stored in
+ * socat_tty_path/socat_socket_path and the resulting child PID is saved in
+ * socat_pid so it can be monitored and terminated later.  This function is
+ * used during initialization and whenever the helper needs to be restarted.
+ */
+static void spawn_socat(void) {
+    if (!socat_tty_path || !*socat_tty_path) return; /* no helper requested */
+
+    in_hook++; /* avoid intercepting our own calls in the child */
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child process: construct socat arguments and replace ourselves. */
+        char listen_spec[512];
+        char open_spec[512];
+        snprintf(listen_spec, sizeof(listen_spec),
+                 "UNIX-LISTEN:%s,fork,mode=777", socat_socket_path);
+        snprintf(open_spec, sizeof(open_spec),
+                 "OPEN:%s,raw,echo=0,b115200", socat_tty_path);
+        execlp("socat", "socat", listen_spec, open_spec, (char *)NULL);
+        _exit(1); /* execlp only returns on error */
+    } else if (pid > 0) {
+        /* Parent: remember the PID so we can monitor/cleanup. */
+        socat_pid = pid;
+    } else {
+        /* Fork failed; ensure pid stays negative so future calls retry. */
+        socat_pid = -1;
+    }
+    in_hook--;
+}
+
+/*
+ * Verify that the socat helper is running.  If the process has exited or was
+ * never started, spawn it again.  This allows the library to automatically
+ * recover if the helper crashes or the serial device temporarily disappears.
+ */
+static void ensure_socat(void) {
+    if (!socat_tty_path) return; /* helper never requested */
+
+    if (socat_pid > 0) {
+        /* Non-blocking check whether the child is still alive. */
+        pid_t r = waitpid(socat_pid, NULL, WNOHANG);
+        if (r == 0) return; /* still running */
+    }
+
+    /* Either the helper died or was never started: attempt to spawn it. */
+    spawn_socat();
+}
+
 /* Establish the global socket descriptor if not already connected. */
 static void ensure_socket(void) {
     if (sock_fd >= 0) return;
@@ -147,6 +203,11 @@ static void ensure_socket(void) {
  */
 static void send_all_or_drop(const char *buf, size_t len) {
     if (in_hook) return;
+
+    /* Before attempting to send any data ensure the socat helper is alive so
+     * external serial redirects remain functional. */
+    ensure_socat();
+
     if (sock_fd < 0) ensure_socket();
     if (sock_fd < 0) return;
 
@@ -157,7 +218,7 @@ static void send_all_or_drop(const char *buf, size_t len) {
             off += n;
             continue;
         }
-        if (n < 0 && (errno == EPIPE || errno == ECONNRESET)) {
+        if (n < 0 && (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)) {
             /* reconnect once */
             if (sock_fd_from_env < 0 && sock_path) {
                 close(sock_fd);
@@ -230,20 +291,13 @@ static void init_i2c_redirect(void) {
          */
         if (!sock || !*sock) sock = "/tmp/ttyS22.tap.sock";
 
-        pid_t pid = fork();
-        if (pid == 0) {
-            /* Child: construct arguments and replace ourselves with socat. */
-            char listen_spec[512];
-            char open_spec[512];
-            snprintf(listen_spec, sizeof(listen_spec),
-                     "UNIX-LISTEN:%s,fork,mode=777", sock);
-            snprintf(open_spec, sizeof(open_spec),
-                     "OPEN:%s,raw,echo=0,b115200", tty);
-            execlp("socat", "socat", listen_spec, open_spec, (char *)NULL);
-            _exit(1); /* execlp only returns on error */
-        } else if (pid > 0) {
-            socat_pid = pid; /* Parent: record PID for destructor. */
-        }
+        /* Remember the paths so the helper can be restarted if it dies. */
+        socat_tty_path = strdup(tty);
+        socat_socket_path = strdup(sock);
+
+        /* Spawn the initial socat helper.  Later sends will verify that it is
+         * still running and restart it if necessary. */
+        spawn_socat();
     }
 }
 
@@ -258,6 +312,9 @@ static void deinit_i2c_redirect(void) {
         kill(socat_pid, SIGTERM);
         waitpid(socat_pid, NULL, 0);
     }
+    /* Free any duplicated path strings used for the socat helper. */
+    free(socat_tty_path);
+    free(socat_socket_path);
 }
 
 // --- open family

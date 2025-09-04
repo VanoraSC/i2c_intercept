@@ -41,11 +41,12 @@ fn main() -> std::io::Result<()> {
         }
     }
 
-    // Every second, write the current timestamp to the device and then read
-    // back a line of text. The companion tap server echoes the write and
-    // prefixes the original data with a monotonically increasing counter in the
-    // form "<counter>: <value>". Parsing this response allows us to verify both
-    // the data integrity and observe the counter for debugging purposes.
+    // Every second the program writes the current timestamp to the I²C device
+    // and expects a binary response. The companion tap server echoes the same
+    // eight bytes back and appends an additional little-endian `u64` counter.
+    // This compact binary protocol avoids the overhead of parsing ASCII text
+    // while still allowing the client to verify that the data round-tripped
+    // correctly and to observe a monotonically increasing sequence number.
     loop {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let secs = now.as_secs();
@@ -58,64 +59,25 @@ fn main() -> std::io::Result<()> {
         // all bytes have been transmitted so the reader sees a complete value.
         file.write_all(&bytes)?;
 
-        // Collect bytes from the device until a newline terminator is seen.
-        // The response is expected to be ASCII and follow the pattern
-        // "<counter>: <value>". Reading byte by byte keeps the logic simple and
-        // avoids buffering more than necessary.
-        let mut raw = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            // Attempt to read a single byte from the I²C device. Using
-            // `read` instead of `read_exact` lets us gracefully handle short
-            // reads or transient I/O errors without terminating the program.
-            match file.read(&mut byte) {
-                // A return of zero can mean two different things depending on
-                // when it occurs. If no data has been received yet it likely
-                // indicates that the tap server has not responded and we
-                // should give up for this iteration. However, if some bytes
-                // were already read it simply means more data has not yet
-                // arrived. In that case wait briefly and try again so that
-                // the partially received line can be completed instead of
-                // being interpreted as an empty value.
-                Ok(0) => {
-                    if raw.is_empty() {
-                        eprintln!("no data available from device");
-                        break;
-                    } else {
-                        sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                }
-                // Successfully read a byte; accumulate it unless it terminates
-                // the line. Guard against excessively long responses as before.
-                Ok(_) => {
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    raw.push(byte[0]);
-                    if raw.len() > 128 {
-                        break;
-                    }
-                }
-                // Any error is reported but does not abort the entire program,
-                // allowing the writer to continue operating even if a single
-                // read fails.
-                Err(e) => {
-                    eprintln!("read error: {}", e);
-                    break;
-                }
+        // The tap server responds with the same eight bytes followed by an
+        // additional eight-byte counter. Use `read_exact` so that partial reads
+        // are retried until the full 16‑byte packet is received or an error
+        // occurs.
+        let mut resp = [0u8; 16];
+        match file.read_exact(&mut resp) {
+            Ok(_) => {
+                // Split the response into the echoed timestamp and the counter
+                // portion. Converting with `from_le_bytes` yields the native
+                // `u64` values for display and further processing.
+                let echoed = u64::from_le_bytes(resp[0..8].try_into().unwrap());
+                let counter = u64::from_le_bytes(resp[8..16].try_into().unwrap());
+                println!("Read back: {} (counter {})", echoed, counter);
             }
-        }
-
-        let text = String::from_utf8_lossy(&raw);
-        if let Some((ctr, val)) = text.split_once(':') {
-            let counter = ctr.trim().parse::<u64>().unwrap_or(0);
-            let echoed = val.trim().parse::<u64>().unwrap_or(0);
-            println!("Read back: {} (counter {})", echoed, counter);
-        } else {
-            // If the response does not match the expected format, print the
-            // raw string so that developers can inspect the unexpected data.
-            println!("Read back (unparsed): {}", text.trim());
+            Err(e) => {
+                // Report any I/O failure but continue looping so that a transient
+                // error does not permanently stop the writer.
+                eprintln!("read error: {}", e);
+            }
         }
 
         sleep(Duration::from_secs(1));

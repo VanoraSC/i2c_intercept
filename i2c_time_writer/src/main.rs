@@ -12,10 +12,10 @@ use std::{
 const I2C_SLAVE: c_ulong = 0x0703;
 
 // Periodically write the current UNIX time to the specified I²C device
-// address.  The timestamp is sent as an ASCII decimal string followed by a
-// newline so that the line-oriented tap server can parse and echo it.  Using a
-// textual representation keeps the example simple and avoids dealing with byte
-// order when inspecting logs.
+// address. The timestamp is transmitted as a little-endian `u64` so the
+// companion tap server can interpret the binary value directly. Using the raw
+// representation avoids the overhead of formatting ASCII strings and matches
+// the expectation of consumers that operate on native integers.
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -50,17 +50,13 @@ fn main() -> std::io::Result<()> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let secs = now.as_secs();
 
-        // Format the current time as a newline-terminated ASCII string.  The
-        // tap server operates in line mode and expects text, so sending the
-        // timestamp in this form ensures the server can parse and echo the
-        // value without additional decoding.  The newline also delineates each
-        // write operation for both the server and the reader below.
-        let line = format!("{}\n", secs);
+        // Encode the current time as a little-endian byte array. Sending the
+        // raw bytes keeps the wire format compact and unambiguous.
+        let bytes = secs.to_le_bytes();
 
-        // Send the textual timestamp to the I²C device.  `write_all` blocks
-        // until the entire buffer is transmitted, guaranteeing the complete
-        // line is delivered in one operation.
-        file.write_all(line.as_bytes())?;
+        // Write the 8-byte timestamp to the I²C device. `write_all` blocks until
+        // all bytes have been transmitted so the reader sees a complete value.
+        file.write_all(&bytes)?;
 
         // Collect bytes from the device until a newline terminator is seen.
         // The response is expected to be ASCII and follow the pattern
@@ -73,12 +69,22 @@ fn main() -> std::io::Result<()> {
             // `read` instead of `read_exact` lets us gracefully handle short
             // reads or transient I/O errors without terminating the program.
             match file.read(&mut byte) {
-                // A return of zero indicates EOF or that the tap server did
-                // not provide data. Break out of the loop so the outer loop
-                // can try again on the next iteration.
+                // A return of zero can mean two different things depending on
+                // when it occurs. If no data has been received yet it likely
+                // indicates that the tap server has not responded and we
+                // should give up for this iteration. However, if some bytes
+                // were already read it simply means more data has not yet
+                // arrived. In that case wait briefly and try again so that
+                // the partially received line can be completed instead of
+                // being interpreted as an empty value.
                 Ok(0) => {
-                    eprintln!("no data available from device");
-                    break;
+                    if raw.is_empty() {
+                        eprintln!("no data available from device");
+                        break;
+                    } else {
+                        sleep(Duration::from_millis(10));
+                        continue;
+                    }
                 }
                 // Successfully read a byte; accumulate it unless it terminates
                 // the line. Guard against excessively long responses as before.

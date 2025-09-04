@@ -24,6 +24,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -47,6 +49,13 @@ static int sock_fd = -1;
 static int sock_fd_from_env = -1;
 static char *sock_path = NULL;
 static int passthrough = 0; /* Whether to forward I²C operations. */
+
+/*
+ * PID of an optional socat helper process.  When I2C_SOCAT_TTY is configured
+ * we spawn a child that bridges a Unix domain socket to a serial port.  The
+ * PID is saved so the process can be terminated when the library unloads.
+ */
+static pid_t socat_pid = -1;
 
 /* Track which file descriptors correspond to I²C devices and current address. */
 static _Atomic int is_i2c_fd[FD_LIMIT];
@@ -204,6 +213,51 @@ static void init_i2c_redirect(void) {
     }
     const char *sp = getenv("I2C_PROXY_SOCK");
     if (sp && *sp) sock_path = strdup(sp);
+
+    /*
+     * Optional serial redirection: if I2C_SOCAT_TTY is provided spawn a socat
+     * helper that connects a Unix domain socket to the given TTY.  The helper
+     * allows external tools to talk to the serial device using the same JSON
+     * protocol as the proxy socket.  We remember the child PID for cleanup.
+     */
+    const char *tty = getenv("I2C_SOCAT_TTY");
+    if (tty && *tty) {
+        const char *sock = getenv("I2C_SOCAT_SOCKET");
+        /*
+         * If the helper's socket path isn't specified default to
+         * /tmp/ttyS22.tap.sock so all components agree on a common
+         * location.
+         */
+        if (!sock || !*sock) sock = "/tmp/ttyS22.tap.sock";
+
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* Child: construct arguments and replace ourselves with socat. */
+            char listen_spec[512];
+            char open_spec[512];
+            snprintf(listen_spec, sizeof(listen_spec),
+                     "UNIX-LISTEN:%s,fork,mode=777", sock);
+            snprintf(open_spec, sizeof(open_spec),
+                     "OPEN:%s,raw,echo=0,b115200", tty);
+            execlp("socat", "socat", listen_spec, open_spec, (char *)NULL);
+            _exit(1); /* execlp only returns on error */
+        } else if (pid > 0) {
+            socat_pid = pid; /* Parent: record PID for destructor. */
+        }
+    }
+}
+
+/*
+ * Destructor invoked when the shared library is unloaded.  If a socat helper
+ * was spawned in init_i2c_redirect(), terminate it so no stray processes are
+ * left running once the host program exits.
+ */
+__attribute__((destructor))
+static void deinit_i2c_redirect(void) {
+    if (socat_pid > 0) {
+        kill(socat_pid, SIGTERM);
+        waitpid(socat_pid, NULL, 0);
+    }
 }
 
 // --- open family

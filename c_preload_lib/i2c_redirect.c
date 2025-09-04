@@ -127,7 +127,12 @@ static int is_marked_i2c(int fd) {
 }
 
 // --- socket connect & send (with retry)
-/* Connect to the proxy Unix socket, returning the new fd or -1 on error. */
+/*
+ * Connect to the proxy Unix socket, returning the new fd or -1 on error.
+ * The socket is configured in non-blocking mode so future sends will fail
+ * fast rather than stalling the intercepted process when the peer stops
+ * draining data.
+ */
 static int connect_socket_path(const char *path) {
     int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
@@ -142,6 +147,11 @@ static int connect_socket_path(const char *path) {
     if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
         int e = errno; close(fd); errno = e; return -1;
     }
+    /* Put the socket into non-blocking mode so later sends return immediately
+     * if the receiver stops consuming data.  Errors here are ignored since the
+     * socket will simply remain blocking, restoring the previous behavior. */
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     return fd;
 }
 
@@ -217,8 +227,10 @@ static void ensure_socket(void) {
 }
 
 /*
- * Send len bytes, reconnecting once on EPIPE/ECONNRESET. If reconnection fails
- * the data is silently dropped.
+ * Send len bytes over the proxy socket in non-blocking mode.  When the socket
+ * buffer fills up the remaining bytes are discarded so the intercepted
+ * process never blocks on slow or absent readers.  A single reconnection
+ * attempt is made on connection related errors.
  */
 static void send_all_or_drop(const char *buf, size_t len) {
     if (in_hook) return;
@@ -232,7 +244,8 @@ static void send_all_or_drop(const char *buf, size_t len) {
 
     ssize_t off = 0;
     while ((size_t)off < len) {
-        ssize_t n = send(sock_fd, buf + off, len - off, MSG_NOSIGNAL);
+        ssize_t n = send(sock_fd, buf + off, len - off,
+                         MSG_NOSIGNAL | MSG_DONTWAIT);
         if (n > 0) {
             off += n;
             continue;
@@ -248,9 +261,17 @@ static void send_all_or_drop(const char *buf, size_t len) {
             } else {
                 return; /* cannot reconnect fd-from-env */
             }
-        } else {
-            return; /* other error -> drop */
         }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            /*
+             * The send buffer is full; drop the remaining bytes to avoid
+             * blocking the application.  This mirrors the behavior of many
+             * tracing tools which sacrifice data when the consumer falls
+             * behind.
+             */
+            return;
+        }
+        return; /* other error or zero write -> drop */
     }
 }
 

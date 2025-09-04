@@ -415,7 +415,8 @@ static void init_i2c_redirect(void) {
 /*
  * Destructor invoked when the shared library is unloaded.  If a socat helper
  * was spawned in init_i2c_redirect(), terminate it so no stray processes are
- * left running once the host program exits.
+ * left running once the host program exits.  The function also closes any
+ * proxy socket and frees duplicated strings to avoid leaking resources.
  */
 __attribute__((destructor))
 static void deinit_i2c_redirect(void) {
@@ -423,6 +424,13 @@ static void deinit_i2c_redirect(void) {
         kill(socat_pid, SIGTERM);
         waitpid(socat_pid, NULL, 0);
     }
+    /* Close the forwarding socket if it was ever opened to avoid leaks. */
+    if (sock_fd >= 0) {
+        close(sock_fd);
+        sock_fd = -1;
+    }
+    /* Free the duplicated socket path allocated during initialization. */
+    free(sock_path);
     /* Free any duplicated path strings used for the socat helper. */
     free(socat_tty_path);
     free(socat_socket_path);

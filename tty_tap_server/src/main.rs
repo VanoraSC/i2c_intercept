@@ -1,6 +1,6 @@
 use std::env;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -8,9 +8,9 @@ use std::time::Duration;
 /// Connect to `/dev/ttyS22`, log received messages, and optionally echo them
 /// back. When the `I2C_PROXY_RAW` environment variable is set to any value
 /// other than `0`, the program expects binary `[addr][cmd][len][data...]` frames
-/// and prints the full frame as a hexadecimal string. Otherwise it treats the
-/// input as newline-delimited text, logging each line and echoing it back with
-/// an incrementing counter.
+/// and prints the full frame as a hexadecimal string. Otherwise it reads
+/// eight-byte little-endian timestamps, logging each value and echoing it back
+/// as a textual line with an incrementing counter.
 fn main() -> io::Result<()> {
     // Path to the serial port that the server will interact with.
     let path = Path::new("/dev/ttyS22");
@@ -71,26 +71,31 @@ fn main() -> io::Result<()> {
             writer.flush()?;
         }
     } else {
-        // Text mode mirrors the previous behavior: read lines, log them and
-        // echo back a response with a monotonically increasing counter. The
-        // clone ensures the writer is independent from the buffered reader.
-        let reader = BufReader::new(file.try_clone()?);
+        // In text mode the connected writer sends raw `u64` timestamps. Clone
+        // the file descriptor so reading and writing can occur independently.
+        let mut reader = file.try_clone()?;
         let mut writer = file;
         println!("Listening on {:?}...", path);
         let mut counter: u64 = 0;
 
-        // Process each line received from the device.
-        for line in reader.lines() {
-            let line = line?;
-            if line.is_empty() {
-                continue;
+        loop {
+            // Attempt to read exactly eight bytes representing a little-endian
+            // `u64` of seconds since the UNIX epoch. Any unexpected EOF ends
+            // the loop while other errors are surfaced to the caller.
+            let mut buf = [0u8; 8];
+            if let Err(e) = reader.read_exact(&mut buf) {
+                if e.kind() != io::ErrorKind::UnexpectedEof {
+                    return Err(e);
+                }
+                break;
             }
+            let secs = u64::from_le_bytes(buf);
+            println!("Received: {}", secs);
 
-            println!("Received: {}", line);
-
-            // Prepare a response that includes an incrementing counter and the
-            // original data, then send it back to the device.
-            let response = format!("{}: {}\n", counter, line);
+            // Echo the timestamp back as an ASCII line that includes a
+            // monotonically increasing counter. The trailing newline matches
+            // the expectations of the I²C time writer's read loop.
+            let response = format!("{}: {}\n", counter, secs);
             writer.write_all(response.as_bytes())?;
             writer.flush()?;
             counter += 1;

@@ -37,3 +37,17 @@ Remove build artifacts with:
 make clean
 ```
 
+## Serial forwarding with socat
+
+When using the `c_preload_lib` you can have it automatically start a
+`socat` process that bridges a Unix domain socket to a serial TTY. Configure
+the following environment variables before launching the target application:
+
+* `I2C_SOCAT_TTY` – path of the serial device (e.g. `/dev/ttyS22`).
+* `I2C_SOCAT_SOCKET` – Unix socket path for the `socat` listener. Defaults to
+  `/tmp/ttyS22.tap.sock` if unset.
+
+Set `I2C_PROXY_SOCK` to the same socket so the preload library connects to the
+bridge. The helper process is automatically terminated when the library is
+unloaded.
+

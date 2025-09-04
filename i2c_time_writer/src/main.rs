@@ -69,17 +69,35 @@ fn main() -> std::io::Result<()> {
         let mut raw = Vec::new();
         loop {
             let mut byte = [0u8; 1];
-            // Read a single byte; if this fails the I²C transaction likely
-            // did not produce a response and the error will bubble up.
-            file.read_exact(&mut byte)?;
-            if byte[0] == b'\n' {
-                break;
-            }
-            raw.push(byte[0]);
-            // Guard against excessively long or malformed responses by
-            // capping the buffer size.
-            if raw.len() > 128 {
-                break;
+            // Attempt to read a single byte from the I²C device. Using
+            // `read` instead of `read_exact` lets us gracefully handle short
+            // reads or transient I/O errors without terminating the program.
+            match file.read(&mut byte) {
+                // A return of zero indicates EOF or that the tap server did
+                // not provide data. Break out of the loop so the outer loop
+                // can try again on the next iteration.
+                Ok(0) => {
+                    eprintln!("no data available from device");
+                    break;
+                }
+                // Successfully read a byte; accumulate it unless it terminates
+                // the line. Guard against excessively long responses as before.
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    raw.push(byte[0]);
+                    if raw.len() > 128 {
+                        break;
+                    }
+                }
+                // Any error is reported but does not abort the entire program,
+                // allowing the writer to continue operating even if a single
+                // read fails.
+                Err(e) => {
+                    eprintln!("read error: {}", e);
+                    break;
+                }
             }
         }
 

@@ -1,17 +1,41 @@
 use std::env;
 use std::fs::OpenOptions;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
+use serde_json::Value;
 
-/// Connect to `/dev/ttyS22`, log received messages, and optionally echo them
-/// back. When the `I2C_PROXY_RAW` environment variable is set to any value
-/// other than `0`, the program expects binary `[addr][cmd][len][data...]` frames
-/// and prints the full frame as a hexadecimal string. Otherwise it reads
-/// eight-byte little-endian timestamps, logging each value and echoing it back
-/// as the same eight bytes followed by an additional little-endian `u64`
-/// counter.
+/// Decode a hexadecimal string into a vector of bytes.
+///
+/// The JSON emitted by the I²C redirect library represents binary payloads as
+/// lower-case hexadecimal strings.  To reconstruct the original bytes we
+/// manually parse the string two characters at a time.  Returning `None` when
+/// encountering invalid characters or odd-length input allows the caller to
+/// gracefully handle malformed data without panicking or pulling in additional
+/// dependencies just for hex decoding.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 { return None; }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for i in 0..(s.len() / 2) {
+        let byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
+        out.push(byte);
+    }
+    Some(out)
+}
+
+/// Connect to `/dev/ttyS22`, interpret incoming traffic from the I²C redirect
+/// library and provide suitable responses. When the `I2C_PROXY_RAW`
+/// environment variable is set to any value other than `0`, the program
+/// expects binary `[addr][cmd][len][data...]` frames and prints the full frame
+/// as a hexadecimal string while echoing the frame back unmodified.
+///
+/// In the default mode the redirect library sends newline separated JSON
+/// objects describing I²C activity.  For `write` events the JSON contains a
+/// `data_hex` field holding the transmitted bytes.  This server decodes the
+/// payload, logs the embedded timestamp and replies with the same eight bytes
+/// followed by an additional little-endian `u64` counter so client programs can
+/// verify that the round-trip occurred.
 fn main() -> io::Result<()> {
     // Path to the serial port that the server will interact with.
     let path = Path::new("/dev/ttyS22");
@@ -91,43 +115,58 @@ fn main() -> io::Result<()> {
                 }
             }
         } else {
-            // In the default mode the connected writer sends raw `u64`
-            // timestamps. Clone the file descriptor so that reading and writing
-            // do not interfere with each other.
-            let mut reader = file.try_clone()?;
+            // In JSON mode the redirect library delivers newline separated
+            // objects describing I²C operations.  We parse each line and, when a
+            // `write` event is observed, decode the hexadecimal payload and
+            // craft a binary response.
+
+            // Use a buffered reader for convenient line-based processing.  The
+            // file descriptor is cloned so writes do not disturb the reader's
+            // internal state.
+            let reader = BufReader::new(file.try_clone()?);
             let mut writer = file;
             println!("Listening on {:?}...", path);
             let mut counter: u64 = 0;
 
-            loop {
-                // Attempt to read exactly eight bytes representing a
-                // little-endian `u64` of seconds since the UNIX epoch. Any I/O
-                // error indicates the peer has gone away and causes a break out
-                // of the loop so we can wait for reconnection.
-                let mut buf = [0u8; 8];
-                if let Err(e) = reader.read_exact(&mut buf) {
-                    println!("Read error: {}", e);
-                    break;
-                }
-                let secs = u64::from_le_bytes(buf);
-                println!("Received: {}", secs);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(e) => { println!("Read error: {}", e); break; }
+                };
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
 
-                // Echo the timestamp back followed by a monotonically
-                // increasing counter. Both values are sent as little-endian
-                // `u64` integers to keep the protocol compact and easy to
-                // consume.
-                let mut response = Vec::with_capacity(16);
-                response.extend_from_slice(&buf);
-                response.extend_from_slice(&counter.to_le_bytes());
-                if let Err(e) = writer.write_all(&response) {
-                    println!("Write error: {}", e);
-                    break;
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(v) => {
+                        // Only `write` events contain payload bytes that need to
+                        // be echoed back to the client. Other event types are
+                        // logged and ignored.
+                        let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
+                        if typ == "write" {
+                            if let Some(hex) = v.get("data_hex").and_then(|d| d.as_str()) {
+                                if let Some(bytes) = decode_hex(hex) {
+                                    if bytes.len() >= 8 {
+                                        let secs = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                                        println!("Received: {}", secs);
+                                        let mut resp = Vec::with_capacity(16);
+                                        resp.extend_from_slice(&bytes[0..8]);
+                                        resp.extend_from_slice(&counter.to_le_bytes());
+                                        if let Err(e) = writer.write_all(&resp) { println!("Write error: {}", e); break; }
+                                        if let Err(e) = writer.flush() { println!("Flush error: {}", e); break; }
+                                        counter += 1;
+                                    } else {
+                                        println!("write event too short");
+                                    }
+                                } else {
+                                    println!("invalid hex payload: {}", hex);
+                                }
+                            }
+                        } else {
+                            println!("Ignoring event: {}", typ);
+                        }
+                    }
+                    Err(_) => println!("(raw) {}", trimmed),
                 }
-                if let Err(e) = writer.flush() {
-                    println!("Flush error: {}", e);
-                    break;
-                }
-                counter += 1;
             }
         }
 

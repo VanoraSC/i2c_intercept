@@ -50,19 +50,23 @@ fn main() -> io::Result<()> {
             println!("Listening on {:?} (raw)...", path);
             loop {
                 // Each frame begins with a three byte header: address, command
-                // and payload length. An unexpected EOF simply terminates the
-                // loop so we can return to the waiting state.
+                // and payload length. Any I/O error—including the device being
+                // unplugged—terminates the loop so the outer loop can
+                // re-establish the connection.
                 let mut hdr = [0u8; 3];
                 if let Err(e) = reader.read_exact(&mut hdr) {
-                    if e.kind() != io::ErrorKind::UnexpectedEof {
-                        return Err(e);
-                    }
+                    println!("Read error: {}", e);
                     break;
                 }
+
                 let len = hdr[2] as usize;
-                // Read the payload based on the length specified in the header.
+                // Read the payload based on the length specified in the header
+                // and break on any failure to allow reconnection attempts.
                 let mut data = vec![0u8; len];
-                reader.read_exact(&mut data)?;
+                if let Err(e) = reader.read_exact(&mut data) {
+                    println!("Read error: {}", e);
+                    break;
+                }
 
                 // Assemble the full frame and render it as a concatenated hex
                 // string for easy inspection.
@@ -74,9 +78,16 @@ fn main() -> io::Result<()> {
                 // Echo the raw frame back to the serial device so that
                 // connected firmware expecting a reply can continue operating.
                 // Flushing the writer immediately ensures the bytes are pushed
-                // out on the wire.
-                writer.write_all(&frame)?;
-                writer.flush()?;
+                // out on the wire. Any write error is treated as a lost
+                // connection and triggers a return to the waiting state.
+                if let Err(e) = writer.write_all(&frame) {
+                    println!("Write error: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush() {
+                    println!("Flush error: {}", e);
+                    break;
+                }
             }
         } else {
             // In text mode the connected writer sends raw `u64` timestamps.
@@ -89,14 +100,12 @@ fn main() -> io::Result<()> {
 
             loop {
                 // Attempt to read exactly eight bytes representing a
-                // little-endian `u64` of seconds since the UNIX epoch. Any
-                // unexpected EOF ends the loop while other errors are surfaced
-                // to the caller.
+                // little-endian `u64` of seconds since the UNIX epoch. Any I/O
+                // error indicates the peer has gone away and causes a break out
+                // of the loop so we can wait for reconnection.
                 let mut buf = [0u8; 8];
                 if let Err(e) = reader.read_exact(&mut buf) {
-                    if e.kind() != io::ErrorKind::UnexpectedEof {
-                        return Err(e);
-                    }
+                    println!("Read error: {}", e);
                     break;
                 }
                 let secs = u64::from_le_bytes(buf);
@@ -104,10 +113,18 @@ fn main() -> io::Result<()> {
 
                 // Echo the timestamp back as an ASCII line that includes a
                 // monotonically increasing counter. The trailing newline matches
-                // the expectations of the I²C time writer's read loop.
+                // the expectations of the I²C time writer's read loop. Write
+                // errors are handled the same way as read errors so that a lost
+                // connection results in another attempt to open the device.
                 let response = format!("{}: {}\n", counter, secs);
-                writer.write_all(response.as_bytes())?;
-                writer.flush()?;
+                if let Err(e) = writer.write_all(response.as_bytes()) {
+                    println!("Write error: {}", e);
+                    break;
+                }
+                if let Err(e) = writer.flush() {
+                    println!("Flush error: {}", e);
+                    break;
+                }
                 counter += 1;
             }
         }

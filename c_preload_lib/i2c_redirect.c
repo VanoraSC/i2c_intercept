@@ -257,6 +257,84 @@ static void emitf(const char *fmt, ...) {
     emit_json_line(buf);
 }
 
+// --- JSON logging helpers -------------------------------------------------
+/*
+ * The original implementation embedded large printf-style JSON format strings
+ * directly at each call site.  That made the control flow harder to read and
+ * obscured the intent of the surrounding logic.  The helpers below centralize
+ * all JSON construction so higher level hooks simply invoke a small function
+ * with well named parameters.
+ */
+
+/* Emit an \"open\" event describing the file descriptor and path. */
+static void log_open_event(int fd, const char *path) {
+    emitf("{\"type\":\"open\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"path\":\"%s\"}",
+          getpid(), now_ns(), fd, path);
+}
+
+/* Emit a \"close\" event when an I\u00b2C descriptor is closed. */
+static void log_close_event(int fd) {
+    emitf("{\"type\":\"close\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d}",
+          getpid(), now_ns(), fd);
+}
+
+/* Emit a \"write\" event including optional data payload. */
+static void log_write_event(int fd, int addr, size_t len,
+                            const char *data_hex, int truncated) {
+    emitf("{\"type\":\"write\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%d,\"len\":%zu,\"data_hex\":\"%s\"}%s",
+          getpid(), now_ns(), fd, addr, len, data_hex,
+          (truncated ? " /*truncated*/" : ""));
+}
+
+/* Emit header line for an I2C_RDWR ioctl event. */
+static void log_rdwr_start(int fd, int nmsgs, long long ts) {
+    emitf("{\"type\":\"ioctl_rdwr\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"nmsgs\":%d,\"detail\":[",
+          getpid(), ts, fd, nmsgs);
+}
+
+/* Emit a single message element within an I2C_RDWR ioctl event. */
+static void log_rdwr_msg(int idx, const struct i2c_msg *m, int last) {
+    emitf("{\"idx\":%d,\"addr\":%u,\"flags\":%u,\"len\":%u,", idx, m->addr, m->flags, m->len);
+    if (m->flags & I2C_M_RD) {
+        emitf("\"dir\":\"read\"}%s", (last ? "" : ","));
+    } else {
+        size_t take = m->len > 8192 ? 8192 : m->len;
+        char *hex = malloc(take*2 + 1);
+        if (hex) {
+            hex_encode(hex, (const unsigned char*)m->buf, take);
+            emitf("\"dir\":\"write\",\"data_hex\":\"%s\"}%s", hex, (last ? "" : ","));
+            free(hex);
+        } else {
+            emitf("\"dir\":\"write\",\"data_hex\":\"\"}%s", (last ? "" : ","));
+        }
+    }
+}
+
+/* Terminate an I2C_RDWR ioctl event. */
+static void log_rdwr_end(void) {
+    emitf("]}");
+}
+
+/* Emit an event describing a slave address change ioctl. */
+static void log_ioctl_set_slave(int fd, unsigned long addr, int force) {
+    emitf("{\"type\":\"ioctl_set_slave\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%lu,\"force\":%s}",
+          getpid(), now_ns(), fd, addr, (force ? "true" : "false"));
+}
+
+/* Emit an event describing a generic SMBus ioctl. */
+static void log_ioctl_smbus(int fd, const struct i2c_smbus_ioctl_data *sd) {
+    emitf("{\"type\":\"ioctl_smbus\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"read\":%s,\"command\":%u,\"size\":%u}",
+          getpid(), now_ns(), fd,
+          (sd->read_write == I2C_SMBUS_READ ? "true" : "false"),
+          sd->command, sd->size);
+}
+
+/* Emit an event for any other ioctl commands that are not specially handled. */
+static void log_ioctl_other(int fd, unsigned long req) {
+    emitf("{\"type\":\"ioctl_other\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"req\":%lu}",
+          getpid(), now_ns(), fd, req);
+}
+
 // --- init
 /* Constructor that initializes environment-derived settings. */
 __attribute__((constructor))
@@ -333,8 +411,7 @@ static int handle_open_common(const char *path, int flags, mode_t *mode_opt, int
     in_hook--;
     if (fd >= 0 && is_i2c_path(path)) {
         mark_i2c_fd(fd, 1);
-        emitf("{\"type\":\"open\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"path\":\"%s\"}",
-              getpid(), now_ns(), fd, path);
+        log_open_event(fd, path);
     }
     return fd;
 }
@@ -371,8 +448,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
     in_hook--;
     if (fd >= 0 && is_i2c_path(path)) {
         mark_i2c_fd(fd, 1);
-        emitf("{\"type\":\"open\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"path\":\"%s\"}",
-              getpid(), now_ns(), fd, path);
+        log_open_event(fd, path);
     }
     return fd;
 }
@@ -381,8 +457,7 @@ int openat(int dirfd, const char *path, int flags, ...) {
 int close(int fd) {
     ensure_resolved();
     if (is_marked_i2c(fd)) {
-        emitf("{\"type\":\"close\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d}",
-              getpid(), now_ns(), fd);
+        log_close_event(fd);
         mark_i2c_fd(fd, 0);
     }
     in_hook++;
@@ -406,8 +481,7 @@ ssize_t write(int fd, const void *buf, size_t count) {
         char *hex = malloc(n * 2 + 1);
         if (hex) {
             hex_encode(hex, (const unsigned char *)buf, n);
-            emitf("{\"type\":\"write\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%d,\"len\":%zu,\"data_hex\":\"%s\"}%s",
-                  getpid(), now_ns(), fd, addr, count, hex, (count>max_dump? " /*truncated*/": ""));
+            log_write_event(fd, addr, count, hex, (count>max_dump));
             free(hex);
         }
         if (!passthrough) return (ssize_t)count;
@@ -423,26 +497,12 @@ ssize_t write(int fd, const void *buf, size_t count) {
 /* Emit detailed information for the I2C_RDWR ioctl. */
 static void log_i2c_rdwr(int fd, struct i2c_rdwr_ioctl_data *d) {
     long long ts = now_ns();
-    emitf("{\"type\":\"ioctl_rdwr\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"nmsgs\":%d,\"detail\":[",
-          getpid(), ts, fd, (int)d->nmsgs);
+    log_rdwr_start(fd, (int)d->nmsgs, ts);
     for (int i = 0; i < (int)d->nmsgs; i++) {
         struct i2c_msg *m = &d->msgs[i];
-        emitf("{\"idx\":%d,\"addr\":%u,\"flags\":%u,\"len\":%u,", i, m->addr, m->flags, m->len);
-        if (m->flags & I2C_M_RD) {
-            emitf("\"dir\":\"read\"}%s", (i+1<(int)d->nmsgs?",":""));
-        } else {
-            size_t take = m->len > 8192 ? 8192 : m->len;
-            char *hex = malloc(take*2 + 1);
-            if (hex) {
-                hex_encode(hex, (const unsigned char*)m->buf, take);
-                emitf("\"dir\":\"write\",\"data_hex\":\"%s\"}%s", hex, (i+1<(int)d->nmsgs?",":""));
-                free(hex);
-            } else {
-                emitf("\"dir\":\"write\",\"data_hex\":\"\"}%s", (i+1<(int)d->nmsgs?",":""));
-            }
-        }
+        log_rdwr_msg(i, m, i + 1 >= (int)d->nmsgs);
     }
-    emitf("]}");
+    log_rdwr_end();
 }
 
 /* Main ioctl hook that handles several I²C-specific requests. */
@@ -465,10 +525,9 @@ int ioctl(int fd, unsigned long req, ...) {
         unsigned long addr = va_arg(ap, unsigned long);
         va_end(ap);
         if (fd >= 0 && fd < FD_LIMIT) atomic_store(&current_addr[fd], (int)addr);
-        emitf("{\"type\":\"ioctl_set_slave\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%lu,\"force\":%s}",
-              getpid(), now_ns(), fd, addr, (req==I2C_SLAVE_FORCE? "true":"false"));
+        log_ioctl_set_slave(fd, addr, (req==I2C_SLAVE_FORCE));
         if (passthrough) {
-            in_hook++; ret = real_ioctl(fd, req, addr); in_hook--;
+            in_hook++; ret = real_ioctl(fd, req, addr); in_hook--; 
         } else ret = 0;
         return ret;
     }
@@ -485,20 +544,16 @@ int ioctl(int fd, unsigned long req, ...) {
         struct i2c_smbus_ioctl_data *sd = va_arg(ap, struct i2c_smbus_ioctl_data *);
         va_end(ap);
         if (sd) {
-            emitf("{\"type\":\"ioctl_smbus\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,"
-                  "\"read\":%s,\"command\":%u,\"size\":%u}",
-                  getpid(), now_ns(), fd,
-                  (sd->read_write==I2C_SMBUS_READ? "true":"false"),
-                  sd->command, sd->size);
+            log_ioctl_smbus(fd, sd);
         }
         if (passthrough) { in_hook++; ret = real_ioctl(fd, req, sd); in_hook--; } else ret = 0;
         return ret;
     }
 
+
     void *arg = va_arg(ap, void *);
     va_end(ap);
-    emitf("{\"type\":\"ioctl_other\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"req\":%lu}",
-          getpid(), now_ns(), fd, req);
+    log_ioctl_other(fd, req);
     if (passthrough) { in_hook++; ret = real_ioctl(fd, req, arg); in_hook--; } else ret = 0;
     return ret;
 }

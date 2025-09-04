@@ -4,7 +4,9 @@
 ###
 CROSS_COMPILE ?=
 CC = $(CROSS_COMPILE)gcc
-CFLAGS ?= -O2 -fPIC -Wall -Wextra
+# Default to building an optimized shared library without debug asserts.
+# Users can supply their own CFLAGS to adjust optimization levels.
+CFLAGS ?= -O2 -DNDEBUG -fPIC -Wall -Wextra
 LDFLAGS ?= -shared -ldl
 TARGET := libi2c_redirect.so
 SRC := i2c_redirect.c

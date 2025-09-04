@@ -26,7 +26,14 @@ endif
 
 # Derive the C compiler and Rust target flag from the above configuration.
 CC := $(CROSS_COMPILE)gcc
-CFLAGS ?= -O2 -Wall -Wextra
+# Enable release optimizations and strip debug assertions for any C
+# components built at this level.  Users may override CFLAGS to suit
+# their needs, but by default the build will favor optimized binaries.
+CFLAGS ?= -O2 -DNDEBUG -Wall -Wextra
+# Configure how Cargo invokes Rust builds.  By default we request a
+# release build so the resulting binaries are optimized.  This can be
+# overridden by specifying CARGO_BUILD_FLAGS on the command line.
+CARGO_BUILD_FLAGS ?= --release
 CARGO_TARGET_FLAG :=
 CARGO_ENV :=
 ifneq ($(RUST_TARGET),)
@@ -49,11 +56,11 @@ c_preload_lib:
 
 # Build the Rust based tap server.
 i2c_tap_server:
-	$(CARGO_ENV) cargo build $(CARGO_TARGET_FLAG) --manifest-path i2c_tap_server/Cargo.toml
+	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path i2c_tap_server/Cargo.toml
 
 # Build the utility that writes time data into the I²C stream.
 i2c_time_writer:
-	$(CARGO_ENV) cargo build $(CARGO_TARGET_FLAG) --manifest-path i2c_time_writer/Cargo.toml
+	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path i2c_time_writer/Cargo.toml
 
 # Remove build artifacts from all sub projects so the repository returns to a
 # clean state.

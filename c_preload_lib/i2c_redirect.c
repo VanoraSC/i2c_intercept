@@ -44,6 +44,7 @@
 static int (*real_open)(const char *, int, ...) = NULL;
 static int (*real_open64)(const char *, int, ...) = NULL;
 static int (*real_openat)(int, const char *, int, ...) = NULL;
+static ssize_t (*real_read)(int, void *, size_t) = NULL;
 static ssize_t (*real_write)(int, const void *, size_t) = NULL;
 static int (*real_ioctl)(int, unsigned long, ...) = NULL;
 static int (*real_close)(int) = NULL;
@@ -78,10 +79,12 @@ static _Atomic int current_addr[FD_LIMIT]; // -1 if unknown
 
 /* Resolve the real libc symbol addresses the first time we need them. */
 static void ensure_resolved(void) {
-    if (real_open && real_open64 && real_openat && real_write && real_ioctl && real_close) return;
+    if (real_open && real_open64 && real_openat && real_read && real_write &&
+        real_ioctl && real_close) return;
     real_open   = dlsym(RTLD_NEXT, "open");
     real_open64 = dlsym(RTLD_NEXT, "open64");
     real_openat = dlsym(RTLD_NEXT, "openat");
+    real_read   = dlsym(RTLD_NEXT, "read");
     real_write  = dlsym(RTLD_NEXT, "write");
     real_ioctl  = dlsym(RTLD_NEXT, "ioctl");
     real_close  = dlsym(RTLD_NEXT, "close");
@@ -511,6 +514,41 @@ int close(int fd) {
     int r = real_close(fd);
     in_hook--;
     return r;
+}
+
+// --- read
+/*
+ * Hook for the read syscall that retrieves data from the proxy socket when
+ * an intercepted I²C descriptor attempts to read.  This allows companion
+ * tools like `tty_tap_server` to feed responses back to the client program
+ * without touching real hardware.  When passthrough is enabled the call is
+ * forwarded to the real `read` implementation so that genuine I²C devices are
+ * accessed normally.
+ */
+ssize_t read(int fd, void *buf, size_t count) {
+    ensure_resolved();
+    if (in_hook) return real_read(fd, buf, count);
+
+    if (is_marked_i2c(fd)) {
+        if (passthrough) {
+            in_hook++; ssize_t r = real_read(fd, buf, count); in_hook--; return r;
+        }
+
+        /*
+         * When not talking to real hardware, pull data from the proxy socket.
+         * This mirrors the behavior of the write hook which pushes traffic out
+         * on the same connection.  If no socket is available, return EOF so the
+         * caller can retry later.
+         */
+        ensure_socat();
+        if (sock_fd < 0) ensure_socket();
+        if (sock_fd < 0) return 0;
+
+        ssize_t n = recv(sock_fd, buf, count, 0);
+        return n;
+    }
+
+    in_hook++; ssize_t r = real_read(fd, buf, count); in_hook--; return r;
 }
 
 // --- write

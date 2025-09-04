@@ -49,6 +49,8 @@ static int sock_fd = -1;
 static int sock_fd_from_env = -1;
 static char *sock_path = NULL;
 static int passthrough = 0; /* Whether to forward I²C operations. */
+/* When set, emit binary frames instead of JSON. */
+static int raw_mode = 0;
 
 /*
  * PID of an optional socat helper process.  When I2C_SOCAT_TTY is configured
@@ -257,6 +259,26 @@ static void emitf(const char *fmt, ...) {
     emit_json_line(buf);
 }
 
+/*
+ * Helper for raw mode that sends a binary frame.  The frame format is
+ * [addr][cmd][len][data...] where `cmd` is 0 for writes and 1 for reads.  Only
+ * the first 255 bytes of the payload are sent since the length is encoded in a
+ * single byte.  This mirrors the framing used by the serial tap helpers so the
+ * receive side can forward the data without additional parsing.
+ */
+static void emit_raw_frame(int addr, int cmd, const unsigned char *data,
+                           size_t len) {
+    unsigned char hdr[3];
+    if (len > 255) len = 255;
+    hdr[0] = (unsigned char)addr;
+    hdr[1] = (unsigned char)cmd;
+    hdr[2] = (unsigned char)len;
+    send_all_or_drop((const char *)hdr, sizeof(hdr));
+    if (len > 0) {
+        send_all_or_drop((const char *)data, len);
+    }
+}
+
 // --- JSON logging helpers -------------------------------------------------
 /*
  * The original implementation embedded large printf-style JSON format strings
@@ -343,6 +365,9 @@ static void init_i2c_redirect(void) {
 
     const char *p = getenv("I2C_PROXY_PASSTHROUGH");
     passthrough = (p && *p && strcmp(p, "0") != 0) ? 1 : 0;
+
+    const char *raw = getenv("I2C_PROXY_RAW");
+    raw_mode = (raw && *raw && strcmp(raw, "0") != 0) ? 1 : 0;
 
     const char *fd_str = getenv("I2C_PROXY_SOCK_FD");
     if (fd_str && *fd_str) {
@@ -476,13 +501,19 @@ ssize_t write(int fd, const void *buf, size_t count) {
         int addr = -1;
         if (fd >= 0 && fd < FD_LIMIT) addr = atomic_load(&current_addr[fd]);
 
-        const size_t max_dump = 8192;
-        size_t n = count > max_dump ? max_dump : count;
-        char *hex = malloc(n * 2 + 1);
-        if (hex) {
-            hex_encode(hex, (const unsigned char *)buf, n);
-            log_write_event(fd, addr, count, hex, (count>max_dump));
-            free(hex);
+        if (raw_mode) {
+            /* In raw mode forward the payload as a binary frame. */
+            emit_raw_frame(addr, 0, (const unsigned char *)buf, count);
+        } else {
+            /* Otherwise log the transfer as JSON with a hex encoded body. */
+            const size_t max_dump = 8192;
+            size_t n = count > max_dump ? max_dump : count;
+            char *hex = malloc(n * 2 + 1);
+            if (hex) {
+                hex_encode(hex, (const unsigned char *)buf, n);
+                log_write_event(fd, addr, count, hex, (count>max_dump));
+                free(hex);
+            }
         }
         if (!passthrough) return (ssize_t)count;
     }
@@ -535,7 +566,20 @@ int ioctl(int fd, unsigned long req, ...) {
     if (req == I2C_RDWR) {
         struct i2c_rdwr_ioctl_data *d = va_arg(ap, struct i2c_rdwr_ioctl_data *);
         va_end(ap);
-        if (d) log_i2c_rdwr(fd, d);
+        if (d) {
+            if (raw_mode) {
+                /* Send each message as a binary frame to mirror on-the-wire
+                 * traffic. */
+                for (int i = 0; i < (int)d->nmsgs; i++) {
+                    struct i2c_msg *m = &d->msgs[i];
+                    int cmd = (m->flags & I2C_M_RD) ? 1 : 0;
+                    emit_raw_frame(m->addr, cmd,
+                                   (const unsigned char *)m->buf, m->len);
+                }
+            } else {
+                log_i2c_rdwr(fd, d);
+            }
+        }
         if (passthrough) { in_hook++; ret = real_ioctl(fd, req, d); in_hook--; } else ret = 0;
         return ret;
     }

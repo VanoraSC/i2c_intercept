@@ -1,12 +1,13 @@
 /*
  * i2c_tty_redirect.c
  * -------------------
- * Utility that taps into the JSON stream produced by the I²C redirect
- * library and forwards selected transactions to a serial TTY. Bytes coming
- * back from the TTY are framed and written back to the socket so the proxy
- * can simulate responses. All communication is framed as
- *   [addr][cmd][len][data...]
- * where `cmd` is 0 for a write and 1 for a read.
+ * Utility that taps into the stream produced by the I²C redirect library and
+ * forwards selected transactions to a serial TTY. Bytes coming back from the
+ * TTY are framed and written back to the socket so the proxy can simulate
+ * responses. All communication is framed as `[addr][cmd][len][data...]` where
+ * `cmd` is 0 for a write and 1 for a read. By default messages are exchanged as
+ * JSON lines, but when the `I2C_PROXY_RAW` environment variable is set the
+ * program bypasses the JSON layer and relays the binary frames directly.
  */
 
 #include <stdio.h>
@@ -26,6 +27,8 @@
 
 /* Bitmap of which 7-bit I²C addresses should be forwarded. */
 static int redirect_addr[128];
+/* When non-zero, forward raw binary frames instead of JSON messages. */
+static int raw_mode = 0;
 
 /*
  * Parse the I2C_TTY_ADDRS environment variable which contains a comma
@@ -181,16 +184,22 @@ static void *relay_tty_to_sock(void *arg) {
         if (len < 0 || len > 255) break;
         if (read_full(a->tty_fd, data, (size_t)len) < 0) break;
         if (!redirect_addr[addr]) continue;
-        bin2hex(data, (size_t)len, hex);
-        int n = snprintf(line, sizeof(line),
-                         "{\"type\":\"%s\",\"addr\":%d,\"len\":%d,\"data_hex\":\"%s\"}\n",
-                         cmd ? "read" : "write", addr, len, hex);
-        if (n > 0 && n < (int)sizeof(line)) {
-            ssize_t off = 0;
-            while (off < n) {
-                ssize_t w = write(a->sock_fd, line + off, (size_t)(n - off));
-                if (w <= 0) break;
-                off += w;
+        if (raw_mode) {
+            /* Raw mode: forward the frame as-is to the socket. */
+            if (write(a->sock_fd, hdr, 3) < 0) break;
+            if (len > 0 && write(a->sock_fd, data, (size_t)len) < 0) break;
+        } else {
+            bin2hex(data, (size_t)len, hex);
+            int n = snprintf(line, sizeof(line),
+                             "{\"type\":\"%s\",\"addr\":%d,\"len\":%d,\"data_hex\":\"%s\"}\n",
+                             cmd ? "read" : "write", addr, len, hex);
+            if (n > 0 && n < (int)sizeof(line)) {
+                ssize_t off = 0;
+                while (off < n) {
+                    ssize_t w = write(a->sock_fd, line + off, (size_t)(n - off));
+                    if (w <= 0) break;
+                    off += w;
+                }
             }
         }
     }
@@ -204,6 +213,8 @@ static void *relay_tty_to_sock(void *arg) {
  */
 int main(void) {
     parse_addr_env();
+    const char *raw = getenv("I2C_PROXY_RAW");
+    raw_mode = (raw && *raw && strcmp(raw, "0") != 0);
     const char *sock_path = getenv("I2C_PROXY_SOCK");
     if (!sock_path || !*sock_path) sock_path = DEFAULT_SOCK_PATH;
     int sock_fd = connect_socket(sock_path);
@@ -222,35 +233,50 @@ int main(void) {
         perror("pthread_create");
         return 1;
     }
-    FILE *fp = fdopen(sock_fd, "r");
-    if (!fp) {
-        perror("fdopen");
-        return 1;
-    }
-    char line[65536];
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "\"type\":\"write\"")) {
-            char *p = strstr(line, "\"addr\":");
-            if (!p) continue;
-            int addr = strtol(p+8, NULL, 10);
-            char *h = strstr(line, "\"data_hex\":\"");
-            if (!h) continue;
-            h += strlen("\"data_hex\":\"");
-            char *end = strchr(h, '\"');
-            if (!end) continue;
-            *end = '\0';
-            forward_write(tty_fd, addr, h);
-        } else if (strstr(line, "\"type\":\"read\"")) {
-            char *p = strstr(line, "\"addr\":");
-            if (!p) continue;
-            int addr = strtol(p+8, NULL, 10);
-            char *h = strstr(line, "\"data_hex\":\"");
-            if (!h) continue;
-            h += strlen("\"data_hex\":\"");
-            char *end = strchr(h, '\"');
-            if (!end) continue;
-            *end = '\0';
-            forward_read(tty_fd, addr, h);
+    if (raw_mode) {
+        unsigned char hdr2[3];
+        unsigned char data[256];
+        while (1) {
+            if (read_full(sock_fd, hdr2, 3) < 0) break;
+            int addr = hdr2[0];
+            int len = hdr2[2];
+            if (len < 0 || len > 255) break;
+            if (read_full(sock_fd, data, (size_t)len) < 0) break;
+            if (!redirect_addr[addr]) continue;
+            if (write(tty_fd, hdr2, 3) < 0) break;
+            if (len > 0 && write(tty_fd, data, (size_t)len) < 0) break;
+        }
+    } else {
+        FILE *fp = fdopen(sock_fd, "r");
+        if (!fp) {
+            perror("fdopen");
+            return 1;
+        }
+        char line[65536];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "\"type\":\"write\"")) {
+                char *p = strstr(line, "\"addr\":");
+                if (!p) continue;
+                int addr = strtol(p+8, NULL, 10);
+                char *h = strstr(line, "\"data_hex\":\"");
+                if (!h) continue;
+                h += strlen("\"data_hex\":\"");
+                char *end = strchr(h, '\"');
+                if (!end) continue;
+                *end = '\0';
+                forward_write(tty_fd, addr, h);
+            } else if (strstr(line, "\"type\":\"read\"")) {
+                char *p = strstr(line, "\"addr\":");
+                if (!p) continue;
+                int addr = strtol(p+8, NULL, 10);
+                char *h = strstr(line, "\"data_hex\":\"");
+                if (!h) continue;
+                h += strlen("\"data_hex\":\"");
+                char *end = strchr(h, '\"');
+                if (!end) continue;
+                *end = '\0';
+                forward_read(tty_fd, addr, h);
+            }
         }
     }
     pthread_cancel(tid);

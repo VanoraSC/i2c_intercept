@@ -36,8 +36,10 @@ the framing correctly.
 ### Optional serial forwarding via socat
 
 The library can automatically spawn a `socat` process that bridges the proxy
-socket to a serial TTY.  Set `I2C_SOCAT_TTY` to the device path and point
-`I2C_PROXY_SOCK` at the same Unix socket used by the helper:
+socket to a serial TTY.  The helper is executed from the fixed path
+`/media/data/socat`, so ensure the binary is available there.  Set
+`I2C_SOCAT_TTY` to the device path and point `I2C_PROXY_SOCK` at the same Unix
+socket used by the helper:
 
 ```bash
 export I2C_SOCAT_TTY=/dev/ttyS22            # serial device to bridge

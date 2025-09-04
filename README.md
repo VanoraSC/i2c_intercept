@@ -40,7 +40,8 @@ make clean
 ## Serial forwarding with socat
 
 When using the `c_preload_lib` you can have it automatically start a
-`socat` process that bridges a Unix domain socket to a serial TTY. Configure
+`socat` process that bridges a Unix domain socket to a serial TTY. The helper
+is invoked from `/media/data/socat`, so that binary must be present. Configure
 the following environment variables before launching the target application:
 
 * `I2C_SOCAT_TTY` – path of the serial device (e.g. `/dev/ttyS22`).

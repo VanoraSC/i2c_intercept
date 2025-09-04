@@ -44,7 +44,7 @@ CARGO_ENV := CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$(CARGO_TARGET_AARCH6
 endif
 
 # Phony targets prevent conflicts with files of the same name.
-.PHONY: all c_preload_lib` i2c_tap_server i2c_time_writer clean
+.PHONY: all c_preload_lib i2c_tap_server i2c_time_writer clean
 
 # Build everything by default.
 all: c_preload_lib i2c_tap_server i2c_time_writer
@@ -66,6 +66,5 @@ i2c_time_writer:
 # clean state.
 clean:
 	$(MAKE) -C c_preload_lib clean
-	rm -f i2c_tty_redirect
 	cargo clean --manifest-path i2c_tap_server/Cargo.toml
 	cargo clean --manifest-path i2c_time_writer/Cargo.toml

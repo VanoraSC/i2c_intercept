@@ -33,6 +33,13 @@
 #define FD_LIMIT 4096
 #endif
 
+/*
+ * Absolute path to the socat binary used when bridging I²C traffic to a
+ * serial device.  Using a fixed path avoids relying on the invoking process'
+ * PATH environment and ensures the intended helper is executed.
+ */
+#define SOCAT_BINARY "/media/data/socat"
+
 // --- real syscalls
 static int (*real_open)(const char *, int, ...) = NULL;
 static int (*real_open64)(const char *, int, ...) = NULL;
@@ -155,8 +162,9 @@ static void spawn_socat(void) {
                  "UNIX-LISTEN:%s,fork,mode=777", socat_socket_path);
         snprintf(open_spec, sizeof(open_spec),
                  "OPEN:%s,raw,echo=0,b115200", socat_tty_path);
-        execlp("socat", "socat", listen_spec, open_spec, (char *)NULL);
-        _exit(1); /* execlp only returns on error */
+        /* Invoke socat from a fixed location so the correct helper is used. */
+        execl(SOCAT_BINARY, "socat", listen_spec, open_spec, (char *)NULL);
+        _exit(1); /* execl only returns on error */
     } else if (pid > 0) {
         /* Parent: remember the PID so we can monitor/cleanup. */
         socat_pid = pid;

@@ -160,8 +160,14 @@ static void spawn_socat(void) {
         char open_spec[512];
         snprintf(listen_spec, sizeof(listen_spec),
                  "UNIX-LISTEN:%s,fork,mode=777", socat_socket_path);
+        /*
+         * Use a PTY link so socat will create the pseudo terminal device if it
+         * does not already exist.  The 'link' option ensures the allocated pty
+         * is symlinked to the requested path, allowing the caller to open it
+         * even when the node was missing before the helper started.
+         */
         snprintf(open_spec, sizeof(open_spec),
-                 "OPEN:%s,raw,echo=0,b115200", socat_tty_path);
+                 "PTY,link=%s,raw,echo=0,b115200", socat_tty_path);
         /* Invoke socat from a fixed location so the correct helper is used. */
         execl(SOCAT_BINARY, "socat", listen_spec, open_spec, (char *)NULL);
         _exit(1); /* execl only returns on error */

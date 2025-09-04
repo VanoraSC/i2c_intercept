@@ -10,7 +10,8 @@ use std::time::Duration;
 /// other than `0`, the program expects binary `[addr][cmd][len][data...]` frames
 /// and prints the full frame as a hexadecimal string. Otherwise it reads
 /// eight-byte little-endian timestamps, logging each value and echoing it back
-/// as a textual line with an incrementing counter.
+/// as the same eight bytes followed by an additional little-endian `u64`
+/// counter.
 fn main() -> io::Result<()> {
     // Path to the serial port that the server will interact with.
     let path = Path::new("/dev/ttyS22");
@@ -90,9 +91,9 @@ fn main() -> io::Result<()> {
                 }
             }
         } else {
-            // In text mode the connected writer sends raw `u64` timestamps.
-            // Clone the file descriptor so reading and writing can occur
-            // independently.
+            // In the default mode the connected writer sends raw `u64`
+            // timestamps. Clone the file descriptor so that reading and writing
+            // do not interfere with each other.
             let mut reader = file.try_clone()?;
             let mut writer = file;
             println!("Listening on {:?}...", path);
@@ -111,13 +112,14 @@ fn main() -> io::Result<()> {
                 let secs = u64::from_le_bytes(buf);
                 println!("Received: {}", secs);
 
-                // Echo the timestamp back as an ASCII line that includes a
-                // monotonically increasing counter. The trailing newline matches
-                // the expectations of the I²C time writer's read loop. Write
-                // errors are handled the same way as read errors so that a lost
-                // connection results in another attempt to open the device.
-                let response = format!("{}: {}\n", counter, secs);
-                if let Err(e) = writer.write_all(response.as_bytes()) {
+                // Echo the timestamp back followed by a monotonically
+                // increasing counter. Both values are sent as little-endian
+                // `u64` integers to keep the protocol compact and easy to
+                // consume.
+                let mut response = Vec::with_capacity(16);
+                response.extend_from_slice(&buf);
+                response.extend_from_slice(&counter.to_le_bytes());
+                if let Err(e) = writer.write_all(&response) {
                     println!("Write error: {}", e);
                     break;
                 }

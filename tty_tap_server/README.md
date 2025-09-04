@@ -1,8 +1,8 @@
 # tty_tap_server
 
 Simple serial tap server that waits for `/dev/ttyS22` to become available,
-prints any lines received, and echoes each line back with an incrementing
-counter.
+prints any eight-byte timestamp packets received, and echoes the same bytes
+back followed by an incrementing counter encoded as another eight bytes.
 
 When the environment variable `I2C_PROXY_RAW` is set to a non-zero value the
 server switches to raw mode. In this mode serial traffic is expected to be in

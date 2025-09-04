@@ -1,11 +1,11 @@
 # i2c_time_writer
 
 Example program that writes the current Unix time to an I²C device once per
-second.  The timestamp is sent as a decimal ASCII string terminated by a
-newline so that a companion tap server operating in line mode can echo the
-data back.  The program is intended to be used with the
-`libi2c_redirect.so` preload library so that all I²C operations are
-intercepted and logged.
+second. The timestamp is transmitted as an eight-byte little-endian binary
+`u64`, keeping the wire format compact and easy to parse. A companion tap
+server echoes the timestamp back and appends its own eight-byte counter. The
+program is intended to be used with the `libi2c_redirect.so` preload library so
+that all I²C operations are intercepted and logged.
 
 ## Build
 
@@ -26,7 +26,8 @@ I2C_PROXY_SOCK=/tmp/ttyS22.tap.sock \
 The first argument is the path to the I²C device, and the second is the 7-bit
 hexadecimal device address. The preload library spawns a `socat` helper (looked
 up at `/media/data/socat`) to bridge the proxy socket to the serial device
-specified by `I2C_SOCAT_TTY`.  Start the `tty_tap_server` in another shell and
+specified by `I2C_SOCAT_TTY`. Start the `tty_tap_server` in another shell and
 then run the command above. The utility writes the current time every second
-and expects to read back a line of the form `N: VALUE` where `N` is an
-incrementing counter from the server and `VALUE` is the echoed timestamp.
+and expects to read back 16 bytes: the original timestamp followed by an
+incrementing counter from the server. Both values are printed in decimal when
+received.

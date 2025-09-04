@@ -37,20 +37,15 @@ CARGO_ENV := CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$(CARGO_TARGET_AARCH6
 endif
 
 # Phony targets prevent conflicts with files of the same name.
-.PHONY: all c_preload_lib i2c_tty_redirect i2c_tap_server i2c_time_writer clean
+.PHONY: all c_preload_lib` i2c_tap_server i2c_time_writer clean
 
 # Build everything by default.
-all: c_preload_lib i2c_tty_redirect i2c_tap_server i2c_time_writer
+all: c_preload_lib i2c_tap_server i2c_time_writer
 
 # Build the C preload library by invoking its own Makefile and forwarding the
 # CROSS_COMPILE setting so it can also be cross compiled.
 c_preload_lib:
 	$(MAKE) -C c_preload_lib CROSS_COMPILE=$(CROSS_COMPILE)
-
-# Compile the i2c_tty_redirect helper which forwards I²C traffic to a serial
-# port.  The program uses pthreads so the -pthread flag is required.
-i2c_tty_redirect: i2c_tty_redirect.c
-	$(CC) $(CFLAGS) -pthread -o $@ $<
 
 # Build the Rust based tap server.
 i2c_tap_server:

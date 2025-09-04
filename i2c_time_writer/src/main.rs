@@ -1,11 +1,21 @@
-use std::{env, fs::OpenOptions, io::{Read, Write}, os::fd::AsRawFd, thread::sleep, time::{Duration, SystemTime, UNIX_EPOCH}};
 use libc::c_ulong;
+use std::{
+    env,
+    fs::OpenOptions,
+    io::{Read, Write},
+    os::fd::AsRawFd,
+    thread::sleep,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 // Constant from linux/i2c-dev.h used to select the target I²C slave.
 const I2C_SLAVE: c_ulong = 0x0703;
 
-// Periodically write the current UNIX time (big-endian u64) to the specified
-// I²C device address.
+// Periodically write the current UNIX time to the specified I²C device
+// address.  The timestamp is sent as an ASCII decimal string followed by a
+// newline so that the line-oriented tap server can parse and echo it.  Using a
+// textual representation keeps the example simple and avoids dealing with byte
+// order when inspecting logs.
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
@@ -19,7 +29,8 @@ fn main() -> std::io::Result<()> {
         u16::from_str_radix(stripped, 16)
     } else {
         args[2].parse()
-    }.expect("invalid address");
+    }
+    .expect("invalid address");
 
     // Open the I²C device and select the slave address.
     let mut file = OpenOptions::new().read(true).write(true).open(dev_path)?;
@@ -38,10 +49,18 @@ fn main() -> std::io::Result<()> {
     loop {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let secs = now.as_secs();
-        let data = secs.to_be_bytes();
 
-        // Send the current time to the I²C device.
-        file.write_all(&data)?;
+        // Format the current time as a newline-terminated ASCII string.  The
+        // tap server operates in line mode and expects text, so sending the
+        // timestamp in this form ensures the server can parse and echo the
+        // value without additional decoding.  The newline also delineates each
+        // write operation for both the server and the reader below.
+        let line = format!("{}\n", secs);
+
+        // Send the textual timestamp to the I²C device.  `write_all` blocks
+        // until the entire buffer is transmitted, guaranteeing the complete
+        // line is delivered in one operation.
+        file.write_all(line.as_bytes())?;
 
         // Collect bytes from the device until a newline terminator is seen.
         // The response is expected to be ASCII and follow the pattern

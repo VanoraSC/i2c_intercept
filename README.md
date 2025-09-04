@@ -52,3 +52,27 @@ Set `I2C_PROXY_SOCK` to the same socket so the preload library connects to the
 bridge. The helper process is automatically terminated when the library is
 unloaded.
 
+## Testing with `tty_tap_server` and `i2c_time_writer`
+
+After building, you can verify the end‑to‑end flow by running the tap server and
+time writer together. In one terminal start the server which listens on the
+serial device `/dev/ttyS22`:
+
+```bash
+./tty_tap_server/target/release/tty_tap_server
+```
+
+In a second terminal run the time writer with the preload library and the
+environment variables that enable the built‑in `socat` bridge:
+
+```bash
+LD_PRELOAD=./c_preload_lib/libi2c_redirect.so \
+I2C_SOCAT_TTY=/dev/ttyS22 I2C_SOCAT_SOCKET=/tmp/ttyS22.tap.sock \
+I2C_PROXY_SOCK=/tmp/ttyS22.tap.sock \
+./i2c_time_writer/target/release/i2c_time_writer /dev/i2c-1 0x50
+```
+
+The time writer sends the current Unix timestamp once per second. The tap server
+logs each line and echoes it back with a counter, which the time writer prints
+to its standard output.
+

@@ -2,9 +2,9 @@
  * i2c_redirect.c
  * ---------------
  * LD_PRELOAD library that intercepts common I²C related syscalls and emits
- * JSON descriptions of the traffic to a Unix domain socket. When the
- * I2C_PROXY_PASSTHROUGH environment variable is unset, operations are
- * swallowed after being logged so nothing touches the real hardware.
+ * JSON descriptions of the traffic to a Unix domain socket.  All intercepted
+ * operations are proxied and never reach real hardware, allowing the caller to
+ * observe bus traffic without affecting physical devices.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -28,6 +28,7 @@
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h> /* For pthread_mutex_t used to serialize I/O */
 
 #ifndef FD_LIMIT
 #define FD_LIMIT 4096
@@ -56,7 +57,6 @@ static _Thread_local int in_hook = 0;
 static int sock_fd = -1;
 static int sock_fd_from_env = -1;
 static char *sock_path = NULL;
-static int passthrough = 0; /* Whether to forward I²C operations. */
 /* When set, emit binary frames instead of JSON. */
 static int raw_mode = 0;
 
@@ -76,6 +76,14 @@ static char *socat_socket_path = NULL;
 /* Track which file descriptors correspond to I²C devices and current address. */
 static _Atomic int is_i2c_fd[FD_LIMIT];
 static _Atomic int current_addr[FD_LIMIT]; // -1 if unknown
+
+/*
+ * Global mutex that serializes intercepted read() and write() operations.
+ * Multiple threads may perform I²C I/O concurrently and the mutex prevents
+ * their traffic from interleaving, preserving the integrity of the captured
+ * stream.
+ */
+pthread_mutex_t i2c_io_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Resolve the real libc symbol addresses the first time we need them. */
 static void ensure_resolved(void) {
@@ -418,9 +426,6 @@ __attribute__((constructor))
 static void init_i2c_redirect(void) {
     ensure_resolved();
 
-    const char *p = getenv("I2C_PROXY_PASSTHROUGH");
-    passthrough = (p && *p && strcmp(p, "0") != 0) ? 1 : 0;
-
     const char *raw = getenv("I2C_PROXY_RAW");
     raw_mode = (raw && *raw && strcmp(raw, "0") != 0) ? 1 : 0;
 
@@ -567,9 +572,7 @@ int close(int fd) {
  * Hook for the read syscall that retrieves data from the proxy socket when
  * an intercepted I²C descriptor attempts to read.  This allows companion
  * tools like `tty_tap_server` to feed responses back to the client program
- * without touching real hardware.  When passthrough is enabled the call is
- * forwarded to the real `read` implementation so that genuine I²C devices are
- * accessed normally.
+ * without touching real hardware.
  */
 ssize_t read(int fd, void *buf, size_t count) {
     /* Trace read attempts along with the requested byte count. */
@@ -577,26 +580,34 @@ ssize_t read(int fd, void *buf, size_t count) {
     ensure_resolved();
     if (in_hook) return real_read(fd, buf, count);
 
-    if (is_marked_i2c(fd)) {
-        if (passthrough) {
-            in_hook++; ssize_t r = real_read(fd, buf, count); in_hook--; return r;
-        }
+    /*
+     * Serialize all intercepted read operations.  This prevents multiple
+     * threads from interleaving I²C traffic which could corrupt the captured
+     * stream or produce confusing logs.
+     */
+    pthread_mutex_lock(&i2c_io_mutex);
 
-        /*
-         * When not talking to real hardware, pull data from the proxy socket.
-         * This mirrors the behavior of the write hook which pushes traffic out
-         * on the same connection.  If no socket is available, return EOF so the
-         * caller can retry later.
-         */
+    ssize_t r = 0;
+
+    if (is_marked_i2c(fd)) {
+        /* Pull data from the proxy socket instead of real hardware.  This
+         * mirrors the behavior of the write hook which pushes traffic out on
+         * the same connection.  If no socket is available return EOF so the
+         * caller can retry later. */
         ensure_socat();
         if (sock_fd < 0) ensure_socket();
-        if (sock_fd < 0) return 0;
+        if (sock_fd < 0) { r = 0; goto out; }
 
-        ssize_t n = recv(sock_fd, buf, count, 0);
-        return n;
+        r = recv(sock_fd, buf, count, 0);
+        goto out;
     }
 
-    in_hook++; ssize_t r = real_read(fd, buf, count); in_hook--; return r;
+    /* Non-I²C descriptors simply call through to the real read(). */
+    in_hook++; r = real_read(fd, buf, count); in_hook--;
+
+out:
+    pthread_mutex_unlock(&i2c_io_mutex);
+    return r;
 }
 
 // --- write
@@ -606,6 +617,11 @@ ssize_t write(int fd, const void *buf, size_t count) {
     trace_log("write fd=%d count=%zu", fd, count);
     ensure_resolved();
     if (in_hook) return real_write(fd, buf, count);
+
+    /* Guard the critical section so concurrent writes do not interleave. */
+    pthread_mutex_lock(&i2c_io_mutex);
+
+    ssize_t r = 0;
 
     if (is_marked_i2c(fd)) {
         int addr = -1;
@@ -625,12 +641,16 @@ ssize_t write(int fd, const void *buf, size_t count) {
                 free(hex);
             }
         }
-        if (!passthrough) return (ssize_t)count;
+        r = (ssize_t)count;
+        goto out;
     }
 
     in_hook++;
-    ssize_t r = real_write(fd, buf, count);
+    r = real_write(fd, buf, count);
     in_hook--;
+
+out:
+    pthread_mutex_unlock(&i2c_io_mutex);
     return r;
 }
 
@@ -663,16 +683,13 @@ int ioctl(int fd, unsigned long req, ...) {
         return r;
     }
 
-    int ret = 0;
     if (req == I2C_SLAVE || req == I2C_SLAVE_FORCE) {
         unsigned long addr = va_arg(ap, unsigned long);
         va_end(ap);
         if (fd >= 0 && fd < FD_LIMIT) atomic_store(&current_addr[fd], (int)addr);
         log_ioctl_set_slave(fd, addr, (req==I2C_SLAVE_FORCE));
-        if (passthrough) {
-            in_hook++; ret = real_ioctl(fd, req, addr); in_hook--; 
-        } else ret = 0;
-        return ret;
+        /* Always pretend success so client code continues to run. */
+        return 0;
     }
 
     if (req == I2C_RDWR) {
@@ -692,8 +709,8 @@ int ioctl(int fd, unsigned long req, ...) {
                 log_i2c_rdwr(fd, d);
             }
         }
-        if (passthrough) { in_hook++; ret = real_ioctl(fd, req, d); in_hook--; } else ret = 0;
-        return ret;
+        /* The real I/O is suppressed; report success to the caller. */
+        return 0;
     }
 
     if (req == I2C_SMBUS) {
@@ -702,14 +719,13 @@ int ioctl(int fd, unsigned long req, ...) {
         if (sd) {
             log_ioctl_smbus(fd, sd);
         }
-        if (passthrough) { in_hook++; ret = real_ioctl(fd, req, sd); in_hook--; } else ret = 0;
-        return ret;
+        return 0;
     }
 
 
-    void *arg = va_arg(ap, void *);
+    (void)va_arg(ap, void *);
     va_end(ap);
     log_ioctl_other(fd, req);
-    if (passthrough) { in_hook++; ret = real_ioctl(fd, req, arg); in_hook--; } else ret = 0;
-    return ret;
+    /* Unknown requests on I²C descriptors are acknowledged but not forwarded. */
+    return 0;
 }

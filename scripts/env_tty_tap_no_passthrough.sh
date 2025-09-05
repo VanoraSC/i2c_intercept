@@ -11,8 +11,8 @@
 #   I2C_PROXY_SOCK     - Socket the preload library connects to
 #   LD_PRELOAD         - Path to the preload library
 # If the chosen serial device does not exist a background `socat` process is
-# started to create it.  The script also unsets I2C_PROXY_PASSTHROUGH to
-# prevent access to actual I²C buses.
+# started to create it.  Passthrough support has been removed so intercepted
+# commands are always proxied.
 
 # Serial device used for tapping; override by pre-setting I2C_SOCAT_TTY.
 export I2C_SOCAT_TTY="${I2C_SOCAT_TTY:-/dev/ttyS22}"
@@ -34,8 +34,7 @@ fi
 export I2C_SOCAT_SOCKET="${I2C_SOCAT_SOCKET:-/tmp/ttyS22.tap.sock}"
 # The preload library connects to the same socket exposed by socat.
 export I2C_PROXY_SOCK="$I2C_SOCAT_SOCKET"
-# Disable passthrough so intercepted calls never reach real I²C hardware.
-unset I2C_PROXY_PASSTHROUGH
+# All traffic is automatically proxied; no passthrough variable is required.
 # Point LD_PRELOAD at the interception library located in the current
 # working directory.  Users may override LD_PRELOAD to supply a different
 # path but by default a relative path is used so this script functions in any
@@ -47,6 +46,5 @@ echo "TTY tap environment configured:"
 echo "  I2C_SOCAT_TTY=$I2C_SOCAT_TTY ($I2C_SOCAT_TTY_STATUS)"
 echo "  I2C_SOCAT_SOCKET=$I2C_SOCAT_SOCKET"
 echo "  I2C_PROXY_SOCK=$I2C_PROXY_SOCK"
-echo "  I2C_PROXY_PASSTHROUGH is unset"
 echo "  LD_PRELOAD=$LD_PRELOAD"
 

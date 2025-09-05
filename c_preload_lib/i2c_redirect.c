@@ -227,24 +227,20 @@ static void ensure_socket(void) {
 }
 
 /*
- * Send {@code len} bytes over the proxy socket in non-blocking mode.  The
- * function attempts to deliver the entire buffer but never blocks the calling
- * process.  When the socket cannot accept the full payload the remaining bytes
- * are dropped and the encountered {@code errno} value is returned so callers
- * can surface the failure (for example {@code EPIPE} when the peer disconnects
- * or {@code EAGAIN} when the send buffer is full).  A single reconnection
- * attempt is made on connection related errors.  A return value of zero
- * indicates success and a positive value represents the error code.
+ * Send len bytes over the proxy socket in non-blocking mode.  When the socket
+ * buffer fills up the remaining bytes are discarded so the intercepted
+ * process never blocks on slow or absent readers.  A single reconnection
+ * attempt is made on connection related errors.
  */
-static int send_all_or_drop(const char *buf, size_t len) {
-    if (in_hook) return 0; /* internal sends are ignored */
+static void send_all_or_drop(const char *buf, size_t len) {
+    if (in_hook) return;
 
     /* Before attempting to send any data ensure the socat helper is alive so
      * external serial redirects remain functional. */
     ensure_socat();
 
     if (sock_fd < 0) ensure_socket();
-    if (sock_fd < 0) return errno ? errno : EPIPE;
+    if (sock_fd < 0) return;
 
     ssize_t off = 0;
     while ((size_t)off < len) {
@@ -255,52 +251,50 @@ static int send_all_or_drop(const char *buf, size_t len) {
             continue;
         }
         if (n < 0 && (errno == EPIPE || errno == ECONNRESET || errno == ENOTCONN)) {
-            /* Connection vanished; try to reconnect once if we created it. */
+            /* reconnect once */
             if (sock_fd_from_env < 0 && sock_path) {
                 close(sock_fd);
                 sock_fd = -1;
                 ensure_socket();
-                if (sock_fd < 0) return errno ? errno : EPIPE; /* give up */
+                if (sock_fd < 0) return; /* give up */
                 continue; /* retry loop */
             } else {
-                return errno; /* cannot reconnect fd-from-env */
+                return; /* cannot reconnect fd-from-env */
             }
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             /*
              * The send buffer is full; drop the remaining bytes to avoid
-             * blocking the application while reporting the condition upward.
+             * blocking the application.  This mirrors the behavior of many
+             * tracing tools which sacrifice data when the consumer falls
+             * behind.
              */
-            return errno;
+            return;
         }
-        /* Other errors or a zero write indicate the message was lost. */
-        return errno ? errno : EPIPE;
+        return; /* other error or zero write -> drop */
     }
-    return 0;
 }
 
-/* Emit a line of JSON, appending a newline if needed.  The return value
- * mirrors that of {@link send_all_or_drop}. */
-static int emit_json_line(const char *s) {
+/* Emit a line of JSON, appending a newline if needed. */
+static void emit_json_line(const char *s) {
     size_t len = strlen(s);
     if (len && s[len-1] == '\n') {
-        return send_all_or_drop(s, len);
+        send_all_or_drop(s, len);
     } else {
-        int err = send_all_or_drop(s, len);
-        if (err) return err;
-        return send_all_or_drop("\n", 1);
+        send_all_or_drop(s, len);
+        send_all_or_drop("\n", 1);
     }
 }
 
 /* printf-style helper that formats a JSON line and sends it. */
-static int emitf(const char *fmt, ...) __attribute__((format(printf,1,2)));
-static int emitf(const char *fmt, ...) {
+static void emitf(const char *fmt, ...) __attribute__((format(printf,1,2)));
+static void emitf(const char *fmt, ...) {
     char buf[65536];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    return emit_json_line(buf);
+    emit_json_line(buf);
 }
 
 /*
@@ -310,19 +304,17 @@ static int emitf(const char *fmt, ...) {
  * single byte.  This mirrors the framing used by the serial tap helpers so the
  * receive side can forward the data without additional parsing.
  */
-static int emit_raw_frame(int addr, int cmd, const unsigned char *data,
-                          size_t len) {
+static void emit_raw_frame(int addr, int cmd, const unsigned char *data,
+                           size_t len) {
     unsigned char hdr[3];
     if (len > 255) len = 255;
     hdr[0] = (unsigned char)addr;
     hdr[1] = (unsigned char)cmd;
     hdr[2] = (unsigned char)len;
-    int err = send_all_or_drop((const char *)hdr, sizeof(hdr));
-    if (err) return err;
+    send_all_or_drop((const char *)hdr, sizeof(hdr));
     if (len > 0) {
-        err = send_all_or_drop((const char *)data, len);
+        send_all_or_drop((const char *)data, len);
     }
-    return err;
 }
 
 // --- JSON logging helpers -------------------------------------------------
@@ -346,12 +338,12 @@ static void log_close_event(int fd) {
           getpid(), now_ns(), fd);
 }
 
-/* Emit a "write" event including optional data payload. */
-static int log_write_event(int fd, int addr, size_t len,
-                           const char *data_hex, int truncated) {
-    return emitf("{\"type\":\"write\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%d,\"len\":%zu,\"data_hex\":\"%s\"}%s",
-                 getpid(), now_ns(), fd, addr, len, data_hex,
-                 (truncated ? " /*truncated*/" : ""));
+/* Emit a \"write\" event including optional data payload. */
+static void log_write_event(int fd, int addr, size_t len,
+                            const char *data_hex, int truncated) {
+    emitf("{\"type\":\"write\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%d,\"len\":%zu,\"data_hex\":\"%s\"}%s",
+          getpid(), now_ns(), fd, addr, len, data_hex,
+          (truncated ? " /*truncated*/" : ""));
 }
 
 /* Emit header line for an I2C_RDWR ioctl event. */
@@ -581,12 +573,7 @@ ssize_t read(int fd, void *buf, size_t count) {
 }
 
 // --- write
-/*
- * Hook for the write syscall that logs data written to I²C descriptors.  Any
- * failure to forward the request to the proxy socket is reported back to the
- * caller so applications can react to delivery problems instead of silently
- * continuing as if the transfer succeeded.
- */
+/* Hook for the write syscall that logs data written to I²C descriptors. */
 ssize_t write(int fd, const void *buf, size_t count) {
     ensure_resolved();
     if (in_hook) return real_write(fd, buf, count);
@@ -595,10 +582,9 @@ ssize_t write(int fd, const void *buf, size_t count) {
         int addr = -1;
         if (fd >= 0 && fd < FD_LIMIT) addr = atomic_load(&current_addr[fd]);
 
-        int err = 0;
         if (raw_mode) {
             /* In raw mode forward the payload as a binary frame. */
-            err = emit_raw_frame(addr, 0, (const unsigned char *)buf, count);
+            emit_raw_frame(addr, 0, (const unsigned char *)buf, count);
         } else {
             /* Otherwise log the transfer as JSON with a hex encoded body. */
             const size_t max_dump = 8192;
@@ -606,17 +592,10 @@ ssize_t write(int fd, const void *buf, size_t count) {
             char *hex = malloc(n * 2 + 1);
             if (hex) {
                 hex_encode(hex, (const unsigned char *)buf, n);
-                err = log_write_event(fd, addr, count, hex, (count>max_dump));
+                log_write_event(fd, addr, count, hex, (count>max_dump));
                 free(hex);
             }
         }
-
-        if (err) {
-            /* Propagate the proxy failure to the caller. */
-            errno = err;
-            return -1;
-        }
-
         if (!passthrough) return (ssize_t)count;
     }
 

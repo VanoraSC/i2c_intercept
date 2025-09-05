@@ -5,6 +5,7 @@ use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use serde_json::Value;
+use tracing::{error, info, trace, warn};
 
 /// Decode a hexadecimal string into a vector of bytes.
 ///
@@ -15,6 +16,7 @@ use serde_json::Value;
 /// gracefully handle malformed data without panicking or pulling in additional
 /// dependencies just for hex decoding.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    trace!("decode_hex len={}", s.len());
     if s.len() % 2 != 0 { return None; }
     let mut out = Vec::with_capacity(s.len() / 2);
     for i in 0..(s.len() / 2) {
@@ -37,6 +39,11 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 /// followed by an additional little-endian `u64` counter so client programs can
 /// verify that the round-trip occurred.
 fn main() -> io::Result<()> {
+    // Initialize tracing so the tap server emits detailed execution logs.
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .init();
+
     // Path to the serial port that the server will interact with.
     let path = Path::new("/dev/ttyS22");
 
@@ -44,6 +51,7 @@ fn main() -> io::Result<()> {
     // the binary lightweight while still allowing developers to switch between
     // framed binary traffic and human readable text without recompilation.
     let raw_mode = env::var("I2C_PROXY_RAW").map_or(false, |v| v != "0");
+    trace!("raw_mode={} path={:?}", raw_mode, path);
 
     // Keep the tap server alive indefinitely. Each iteration waits for the
     // device to appear, processes traffic until the peer closes the connection
@@ -57,7 +65,7 @@ fn main() -> io::Result<()> {
             match OpenOptions::new().read(true).write(true).open(&path) {
                 Ok(f) => break f,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    println!("Waiting for {:?} to become available...", path);
+                    info!("Waiting for {:?} to become available...", path);
                     thread::sleep(Duration::from_millis(500));
                     continue;
                 }
@@ -72,7 +80,7 @@ fn main() -> io::Result<()> {
             // buffered reader.
             let mut reader = BufReader::new(file.try_clone()?);
             let mut writer = file;
-            println!("Listening on {:?} (raw)...", path);
+            info!("Listening on {:?} (raw)...", path);
             loop {
                 // Each frame begins with a three byte header: address, command
                 // and payload length. Any I/O error—including the device being
@@ -80,7 +88,7 @@ fn main() -> io::Result<()> {
                 // re-establish the connection.
                 let mut hdr = [0u8; 3];
                 if let Err(e) = reader.read_exact(&mut hdr) {
-                    println!("Read error: {}", e);
+                    error!("Read error: {}", e);
                     break;
                 }
 
@@ -89,7 +97,7 @@ fn main() -> io::Result<()> {
                 // and break on any failure to allow reconnection attempts.
                 let mut data = vec![0u8; len];
                 if let Err(e) = reader.read_exact(&mut data) {
-                    println!("Read error: {}", e);
+                    error!("Read error: {}", e);
                     break;
                 }
 
@@ -98,7 +106,7 @@ fn main() -> io::Result<()> {
                 let mut frame = hdr.to_vec();
                 frame.extend_from_slice(&data);
                 let hex: String = frame.iter().map(|b| format!("{:02x}", b)).collect();
-                println!("Received (raw): {}", hex);
+                info!("Received (raw): {}", hex);
 
                 // Echo the raw frame back to the serial device so that
                 // connected firmware expecting a reply can continue operating.
@@ -106,11 +114,11 @@ fn main() -> io::Result<()> {
                 // out on the wire. Any write error is treated as a lost
                 // connection and triggers a return to the waiting state.
                 if let Err(e) = writer.write_all(&frame) {
-                    println!("Write error: {}", e);
+                    error!("Write error: {}", e);
                     break;
                 }
                 if let Err(e) = writer.flush() {
-                    println!("Flush error: {}", e);
+                    error!("Flush error: {}", e);
                     break;
                 }
             }
@@ -125,13 +133,13 @@ fn main() -> io::Result<()> {
             // internal state.
             let reader = BufReader::new(file.try_clone()?);
             let mut writer = file;
-            println!("Listening on {:?}...", path);
+            info!("Listening on {:?}...", path);
             let mut counter: u64 = 0;
 
             for line in reader.lines() {
                 let line = match line {
                     Ok(l) => l,
-                    Err(e) => { println!("Read error: {}", e); break; }
+                    Err(e) => { error!("Read error: {}", e); break; }
                 };
                 let trimmed = line.trim();
                 if trimmed.is_empty() { continue; }
@@ -147,33 +155,33 @@ fn main() -> io::Result<()> {
                                 if let Some(bytes) = decode_hex(hex) {
                                     if bytes.len() >= 8 {
                                         let secs = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-                                        println!("Received: {}", secs);
+                                        info!("Received: {}", secs);
                                         let mut resp = Vec::with_capacity(16);
                                         resp.extend_from_slice(&bytes[0..8]);
                                         resp.extend_from_slice(&counter.to_le_bytes());
-                                        if let Err(e) = writer.write_all(&resp) { println!("Write error: {}", e); break; }
-                                        if let Err(e) = writer.flush() { println!("Flush error: {}", e); break; }
+                                        if let Err(e) = writer.write_all(&resp) { error!("Write error: {}", e); break; }
+                                        if let Err(e) = writer.flush() { error!("Flush error: {}", e); break; }
                                         counter += 1;
                                     } else {
-                                        println!("write event too short");
+                                        warn!("write event too short");
                                     }
                                 } else {
-                                    println!("invalid hex payload: {}", hex);
+                                    warn!("invalid hex payload: {}", hex);
                                 }
                             }
                         } else {
-                            println!("Ignoring event: {}", typ);
+                            trace!("Ignoring event: {}", typ);
                         }
                     }
-                    Err(_) => println!("(raw) {}", trimmed),
-                }
+                    Err(_) => trace!("(raw) {}", trimmed),
             }
+        }
         }
 
         // If we exit the inner processing loop the peer has closed the
         // connection. Drop the file handle and return to the top of the outer
         // loop where we will wait for the device to reappear.
-        println!(
+        info!(
             "Connection to {:?} closed. Waiting for the device to be ready again...",
             path
         );

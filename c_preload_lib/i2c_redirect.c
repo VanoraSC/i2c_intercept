@@ -25,6 +25,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <pthread.h>
 #include <signal.h>
 #include <time.h>
 #include <unistd.h>
@@ -59,6 +60,13 @@ static char *sock_path = NULL;
 static int passthrough = 0; /* Whether to forward I²C operations. */
 /* When set, emit binary frames instead of JSON. */
 static int raw_mode = 0;
+
+/*
+ * Mutex guarding access to the proxy socket so concurrent threads do not
+ * interleave request/response pairs.  This ensures that a read request and the
+ * corresponding reply are handled atomically.
+ */
+static pthread_mutex_t socket_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /*
  * PID of an optional socat helper process.  When I2C_SOCAT_TTY is configured
@@ -363,6 +371,11 @@ static void log_write_event(int fd, int addr, size_t len,
           (truncated ? " /*truncated*/" : ""));
 }
 
+/* Emit a "read" request so the tap server knows how many bytes to reply with. */
+static void log_read_request(int addr, size_t len) {
+    emitf("{\"type\":\"read\",\"addr\":%d,\"len\":%zu}", addr, len);
+}
+
 /* Emit header line for an I2C_RDWR ioctl event. */
 static void log_rdwr_start(int fd, int nmsgs, long long ts) {
     emitf("{\"type\":\"ioctl_rdwr\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"nmsgs\":%d,\"detail\":[",
@@ -583,17 +596,59 @@ ssize_t read(int fd, void *buf, size_t count) {
         }
 
         /*
-         * When not talking to real hardware, pull data from the proxy socket.
-         * This mirrors the behavior of the write hook which pushes traffic out
-         * on the same connection.  If no socket is available, return EOF so the
-         * caller can retry later.
+         * When not talking to real hardware, communicate with the proxy
+         * socket.  Acquire the mutex so the read request and corresponding
+         * response are kept together when multiple threads access the socket.
          */
+        pthread_mutex_lock(&socket_mutex);
+
+        /* If the proxy socket cannot be established, unlock and return EOF. */
         ensure_socat();
         if (sock_fd < 0) ensure_socket();
-        if (sock_fd < 0) return 0;
+        if (sock_fd < 0) {
+            pthread_mutex_unlock(&socket_mutex);
+            return 0;
+        }
 
-        ssize_t n = recv(sock_fd, buf, count, 0);
-        return n;
+        /* Determine the current I²C address so the tap server can respond. */
+        int addr = -1;
+        if (fd >= 0 && fd < FD_LIMIT)
+            addr = atomic_load(&current_addr[fd]);
+
+        /* Notify the tap server of the requested read length. */
+        if (raw_mode) {
+            emit_raw_frame(addr, 1, NULL, count);
+        } else {
+            log_read_request(addr, count);
+        }
+
+        /*
+         * Read until the requested byte count is satisfied or an error occurs.
+         * Partial reads are returned to the caller so it can decide whether to
+         * retry.
+         */
+        ssize_t total = 0;
+        while ((size_t)total < count) {
+            ssize_t n = recv(sock_fd, (unsigned char *)buf + total,
+                             count - total, 0);
+            if (n <= 0) {
+                /* Unlock the mutex before propagating errors or EOF. */
+                if (total == 0) {
+                    pthread_mutex_unlock(&socket_mutex);
+                    return n;
+                }
+                break;
+            }
+            total += n;
+        }
+
+        /*
+         * Unlock only after the complete response (or an early error) has been
+         * processed so another thread cannot interleave its own transaction in
+         * the middle of this one.
+         */
+        pthread_mutex_unlock(&socket_mutex);
+        return total;
     }
 
     in_hook++; ssize_t r = real_read(fd, buf, count); in_hook--; return r;

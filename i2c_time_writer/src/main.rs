@@ -7,6 +7,7 @@ use std::{
     thread::sleep,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tracing::{error, info, trace, warn};
 
 // Constant from linux/i2c-dev.h used to select the target I²C slave.
 const I2C_SLAVE: c_ulong = 0x0703;
@@ -17,9 +18,14 @@ const I2C_SLAVE: c_ulong = 0x0703;
 // representation avoids the overhead of formatting ASCII strings and matches
 // the expectation of consumers that operate on native integers.
 fn main() -> std::io::Result<()> {
+    // Initialize tracing so that all subsequent operations emit detailed logs.
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .init();
+
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: {} <i2c-dev-path> <addr>", args[0]);
+        error!("Usage: {} <i2c-dev-path> <addr>", args[0]);
         std::process::exit(1);
     }
 
@@ -31,6 +37,7 @@ fn main() -> std::io::Result<()> {
         args[2].parse()
     }
     .expect("invalid address");
+    trace!("using device {} addr=0x{:x}", dev_path, addr);
 
     // Open the I²C device and select the slave address.
     let mut file = OpenOptions::new().read(true).write(true).open(dev_path)?;
@@ -65,6 +72,7 @@ fn main() -> std::io::Result<()> {
 
         // Write the 8-byte timestamp to the I²C device. `write_all` blocks until
         // all bytes have been transmitted so the reader sees a complete value.
+        trace!("wrote timestamp {}", secs);
         file.write_all(&bytes)?;
 
         // The tap server responds with the same eight bytes followed by an
@@ -85,11 +93,11 @@ fn main() -> std::io::Result<()> {
             if ret == 0 {
                 // No data arrived within the timeout window; warn and abandon
                 // this iteration so the program does not block indefinitely.
-                eprintln!("warning: timed out waiting for response");
+                warn!("timed out waiting for response");
                 break;
             } else if ret < 0 {
                 // Any polling failure is reported and treated like a timeout.
-                eprintln!("poll error: {}", std::io::Error::last_os_error());
+                error!("poll error: {}", std::io::Error::last_os_error());
                 break;
             }
 
@@ -97,7 +105,7 @@ fn main() -> std::io::Result<()> {
                 Ok(0) => {
                     // End-of-file is unexpected for a character device; abort
                     // this iteration so the caller can retry.
-                    eprintln!("unexpected EOF from device");
+                    error!("unexpected EOF from device");
                     break;
                 }
                 Ok(n) => {
@@ -112,7 +120,7 @@ fn main() -> std::io::Result<()> {
                 Err(e) => {
                     // Any other error is reported and the partial read is
                     // discarded so the loop can try again.
-                    eprintln!("read error: {}", e);
+                    error!("read error: {}", e);
                     break;
                 }
             }
@@ -124,7 +132,7 @@ fn main() -> std::io::Result<()> {
             // `u64` values for display and further processing.
             let echoed = u64::from_le_bytes(resp[0..8].try_into().unwrap());
             let counter = u64::from_le_bytes(resp[8..16].try_into().unwrap());
-            println!("Read back: {} (counter {})", echoed, counter);
+            info!("Read back: {} (counter {})", echoed, counter);
         }
 
         sleep(Duration::from_secs(1));

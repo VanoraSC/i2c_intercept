@@ -126,6 +126,23 @@ static int is_marked_i2c(int fd) {
     return 0;
 }
 
+/* Emit a debugging trace message when the I2C_PROXY_TRACE environment
+ * variable is set.  Logging is routed to stderr so it does not interfere
+ * with the standard output of the intercepted application.  The in_hook
+ * guard temporarily disables syscall interception to avoid recursive
+ * logging when vfprintf itself issues write calls.
+ */
+static void trace_log(const char *fmt, ...) {
+    if (!getenv("I2C_PROXY_TRACE")) return;
+    in_hook++;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+    in_hook--;
+}
+
 // --- socket connect & send (with retry)
 /*
  * Connect to the proxy Unix socket, returning the new fd or -1 on error.
@@ -488,6 +505,8 @@ static int handle_open_common(const char *path, int flags, mode_t *mode_opt, int
 }
 
 int open(const char *path, int flags, ...) {
+    /* Trace the open attempt so descriptor creation can be followed. */
+    trace_log("open path=%s flags=0x%x", path, flags);
     mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap);
@@ -497,6 +516,8 @@ int open(const char *path, int flags, ...) {
 }
 
 int open64(const char *path, int flags, ...) {
+    /* Trace the open64 attempt for debugging purposes. */
+    trace_log("open64 path=%s flags=0x%x", path, flags);
     mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list ap; va_start(ap, flags); mode = (mode_t)va_arg(ap, int); va_end(ap);
@@ -506,6 +527,8 @@ int open64(const char *path, int flags, ...) {
 }
 
 int openat(int dirfd, const char *path, int flags, ...) {
+    /* Trace the openat invocation including the directory file descriptor. */
+    trace_log("openat dirfd=%d path=%s flags=0x%x", dirfd, path, flags);
     ensure_resolved();
     mode_t mode = 0;
     int fd;
@@ -526,6 +549,8 @@ int openat(int dirfd, const char *path, int flags, ...) {
 
 // --- close
 int close(int fd) {
+    /* Trace descriptor closure to help follow resource lifetimes. */
+    trace_log("close fd=%d", fd);
     ensure_resolved();
     if (is_marked_i2c(fd)) {
         log_close_event(fd);
@@ -547,6 +572,8 @@ int close(int fd) {
  * accessed normally.
  */
 ssize_t read(int fd, void *buf, size_t count) {
+    /* Trace read attempts along with the requested byte count. */
+    trace_log("read fd=%d count=%zu", fd, count);
     ensure_resolved();
     if (in_hook) return real_read(fd, buf, count);
 
@@ -575,6 +602,8 @@ ssize_t read(int fd, void *buf, size_t count) {
 // --- write
 /* Hook for the write syscall that logs data written to I²C descriptors. */
 ssize_t write(int fd, const void *buf, size_t count) {
+    /* Trace write attempts so payload sizes can be observed. */
+    trace_log("write fd=%d count=%zu", fd, count);
     ensure_resolved();
     if (in_hook) return real_write(fd, buf, count);
 
@@ -619,6 +648,8 @@ static void log_i2c_rdwr(int fd, struct i2c_rdwr_ioctl_data *d) {
 
 /* Main ioctl hook that handles several I²C-specific requests. */
 int ioctl(int fd, unsigned long req, ...) {
+    /* Trace ioctl usage including the raw request code. */
+    trace_log("ioctl fd=%d req=0x%lx", fd, req);
     ensure_resolved();
     va_list ap;
     va_start(ap, req);

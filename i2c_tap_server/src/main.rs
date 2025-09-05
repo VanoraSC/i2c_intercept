@@ -6,6 +6,16 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt}; // for from_mode()
 use std::path::Path;
 use std::thread;
 use serde_json::Value;
+use tracing::{error, info, trace};
+
+// Install a tracing subscriber so detailed logs can be collected.  The
+// configuration enables the TRACE level to provide visibility into all
+// execution paths when the binary is run.
+fn init_tracing() {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .init();
+}
 
 // Simple utility that accepts connections on a Unix domain socket and prints
 // any JSON lines it receives. It is primarily useful for debugging the output
@@ -15,6 +25,7 @@ use serde_json::Value;
 
 /// Handle a single client connection by printing each line as JSON.
 fn handle_client(stream: UnixStream) -> io::Result<()> {
+    trace!("handle_client: new JSON connection");
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = line?;
@@ -22,11 +33,10 @@ fn handle_client(stream: UnixStream) -> io::Result<()> {
         match serde_json::from_str::<Value>(&line) {
             Ok(v) => {
                 let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
-                println!("=== {} ===", typ);
-                println!("{}", serde_json::to_string_pretty(&v).unwrap());
-                println!();
+                info!("=== {} ===", typ);
+                info!("{}", serde_json::to_string_pretty(&v).unwrap());
             }
-            Err(_) => println!("(raw) {}", line),
+            Err(_) => trace!("(raw) {}", line),
         }
     }
     Ok(())
@@ -35,6 +45,7 @@ fn handle_client(stream: UnixStream) -> io::Result<()> {
 /// Handle a client connection in raw mode. Frames are received in the format
 /// `[addr][cmd][len][data...]` where `cmd` is 0 for writes and 1 for reads.
 fn handle_client_raw(mut stream: UnixStream) -> io::Result<()> {
+    trace!("handle_client_raw: new raw connection");
     loop {
         let mut hdr = [0u8; 3];
         if let Err(e) = stream.read_exact(&mut hdr) {
@@ -45,16 +56,21 @@ fn handle_client_raw(mut stream: UnixStream) -> io::Result<()> {
         let addr = hdr[0];
         let cmd = hdr[1];
         let len = hdr[2] as usize;
+        trace!("frame addr=0x{:02x} cmd={} len={}", addr, cmd, len);
         let mut data = vec![0u8; len];
         stream.read_exact(&mut data)?;
         let dir = if cmd == 0 { "write" } else { "read" };
         let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
-        println!("{} addr=0x{:02x} len={} data={}", dir, addr, len, hex);
+        info!("{} addr=0x{:02x} len={} data={}", dir, addr, len, hex);
     }
     Ok(())
 }
 
 fn main() -> io::Result<()> {
+    // Initialize the tracing system before performing any work so early
+    // initialization issues are captured.
+    init_tracing();
+
     // Determine socket path from CLI arg or environment.
     let sock_path = env::args().nth(1)
         .or_else(|| env::var("I2C_PROXY_SOCK").ok())
@@ -63,6 +79,7 @@ fn main() -> io::Result<()> {
     // Toggle raw mode via environment variable. When set, the server expects
     // binary frames instead of JSON lines.
     let raw_mode = env::var("I2C_PROXY_RAW").map_or(false, |v| v != "0");
+    trace!("socket path={} raw_mode={}", sock_path, raw_mode);
 
     // Remove any stale socket path to avoid bind errors.
     let p = Path::new(&sock_path);
@@ -75,7 +92,7 @@ fn main() -> io::Result<()> {
     // Make sure others can connect (optional: set perms)
     let _ = fs::set_permissions(&sock_path, fs::Permissions::from_mode(0o666));
 
-    println!("Listening on {}", sock_path);
+    info!("Listening on {}", sock_path);
 
     // Accept connections and spawn a thread to handle each using the
     // appropriate parsing mode.
@@ -84,17 +101,18 @@ fn main() -> io::Result<()> {
             Ok(stream) => {
                 let is_raw = raw_mode;
                 thread::spawn(move || {
+                    trace!("client connected");
                     let result = if is_raw {
                         handle_client_raw(stream)
                     } else {
                         handle_client(stream)
                     };
                     if let Err(e) = result {
-                        eprintln!("client error: {}", e);
+                        error!("client error: {}", e);
                     }
                 });
             }
-            Err(e) => eprintln!("accept error: {}", e),
+            Err(e) => error!("accept error: {}", e),
         }
     }
     // unreachable in normal flow

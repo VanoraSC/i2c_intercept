@@ -76,25 +76,38 @@ fn main() -> std::io::Result<()> {
         file.write_all(&bytes)?;
 
         // The tap server responds with the same eight bytes followed by an
-        // additional eight-byte counter. Rather than blocking forever waiting
-        // for a full 16-byte response, poll the file descriptor with a timeout
-        // and read incrementally. This allows the loop to continue even if the
-        // tap server becomes unresponsive.
+        // additional eight-byte counter. Waiting indefinitely for that
+        // response would stall the writer if the tap server crashes or the
+        // I²C link is severed. To avoid that, poll the file descriptor with a
+        // short timeout. If no data is available after 10ms the code retries
+        // once. A second timeout is treated as a fatal error for this
+        // iteration and the loop continues so subsequent timestamps can still
+        // be transmitted.
         let mut resp = [0u8; 16];
-        let mut read = 0;
+        let mut read = 0; // Number of bytes read so far into `resp`.
+        let mut attempts = 0; // Counts consecutive poll timeouts.
         while read < resp.len() {
-            // Wait up to one second for the file descriptor to become readable.
+            // Only wait 10ms for a response. If nothing arrives the loop will
+            // retry once more before giving up.
             let mut fds = pollfd {
                 fd,
                 events: POLLIN,
                 revents: 0,
             };
-            let ret = unsafe { libc::poll(&mut fds, 1, 1000) };
+            let ret = unsafe { libc::poll(&mut fds, 1, 10) };
             if ret == 0 {
-                // No data arrived within the timeout window; warn and abandon
-                // this iteration so the program does not block indefinitely.
-                warn!("timed out waiting for response");
-                break;
+                // No data was available before the timeout expired.
+                if attempts == 0 {
+                    // First timeout: issue a warning and try again.
+                    warn!("timed out waiting for response, retrying");
+                    attempts += 1;
+                    continue;
+                } else {
+                    // Second consecutive timeout: emit an error and abort this
+                    // iteration so the main loop can continue.
+                    error!("timed out waiting for response");
+                    break;
+                }
             } else if ret < 0 {
                 // Any polling failure is reported and treated like a timeout.
                 error!("poll error: {}", std::io::Error::last_os_error());
@@ -104,22 +117,25 @@ fn main() -> std::io::Result<()> {
             match file.read(&mut resp[read..]) {
                 Ok(0) => {
                     // End-of-file is unexpected for a character device; abort
-                    // this iteration so the caller can retry.
+                    // this iteration so the caller can retry on the next loop
+                    // iteration.
                     error!("unexpected EOF from device");
                     break;
                 }
                 Ok(n) => {
-                    // Accumulate the bytes read so far and continue until the
-                    // complete response is received.
+                    // Accumulate the bytes read so far. Each successful read
+                    // resets the timeout counter because new data has arrived.
                     read += n;
+                    attempts = 0;
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // The device was not actually ready; poll again.
+                    // The descriptor reported readiness but yielded no data;
+                    // poll again to wait for the remainder of the response.
                     continue;
                 }
                 Err(e) => {
                     // Any other error is reported and the partial read is
-                    // discarded so the loop can try again.
+                    // discarded so the loop can try again on the next second.
                     error!("read error: {}", e);
                     break;
                 }

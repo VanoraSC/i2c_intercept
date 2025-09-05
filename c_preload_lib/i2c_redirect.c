@@ -371,6 +371,12 @@ static void log_write_event(int fd, int addr, size_t len,
           (truncated ? " /*truncated*/" : ""));
 }
 
+/* Emit a "read" event describing the number of bytes requested. */
+static void log_read_event(int fd, int addr, size_t len) {
+    emitf("{\"type\":\"read\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%d,\"len\":%zu}",
+          getpid(), now_ns(), fd, addr, len);
+}
+
 /* Emit header line for an I2C_RDWR ioctl event. */
 static void log_rdwr_start(int fd, int nmsgs, long long ts) {
     emitf("{\"type\":\"ioctl_rdwr\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"nmsgs\":%d,\"detail\":[",
@@ -590,13 +596,26 @@ ssize_t read(int fd, void *buf, size_t count) {
     ssize_t r = 0;
 
     if (is_marked_i2c(fd)) {
-        /* Pull data from the proxy socket instead of real hardware.  This
-         * mirrors the behavior of the write hook which pushes traffic out on
-         * the same connection.  If no socket is available return EOF so the
-         * caller can retry later. */
+        /*
+         * Forward the read request to the proxy so companion tools know how
+         * many bytes the client expects, then wait for the response as if it
+         * came from real hardware.  If the socket cannot be established return
+         * EOF so the caller may retry later.
+         */
         ensure_socat();
         if (sock_fd < 0) ensure_socket();
         if (sock_fd < 0) { r = 0; goto out; }
+
+        int addr = -1;
+        if (fd >= 0 && fd < FD_LIMIT) addr = atomic_load(&current_addr[fd]);
+
+        if (raw_mode) {
+            /* Raw mode uses a compact binary header with no payload. */
+            emit_raw_frame(addr, 1, NULL, count);
+        } else {
+            /* JSON mode logs the requested length for visibility. */
+            log_read_event(fd, addr, count);
+        }
 
         r = recv(sock_fd, buf, count, 0);
         goto out;

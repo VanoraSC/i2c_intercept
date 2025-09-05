@@ -187,7 +187,26 @@ fn main() -> io::Result<()> {
                                     .and_then(|l| l.as_u64())
                                     .map(|l| l as usize)
                                     .unwrap_or(data.len());
+                                // Cap the response length to both the requested
+                                // amount and the number of bytes we actually
+                                // have available from the prior write.
                                 let resp_len = req_len.min(data.len());
+
+                                // Log the details of the read so developers can
+                                // easily trace interactions between the client
+                                // and tap server.
+                                info!(
+                                    "read request for {} bytes, returning {} bytes",
+                                    req_len, resp_len
+                                );
+                                trace!(
+                                    "read response bytes: {}",
+                                    data[..resp_len]
+                                        .iter()
+                                        .map(|b| format!("{:02x}", b))
+                                        .collect::<String>()
+                                );
+
                                 if let Err(e) = writer.write_all(&data[..resp_len]) {
                                     error!("Write error: {}", e);
                                     break;
@@ -197,7 +216,11 @@ fn main() -> io::Result<()> {
                                     break;
                                 }
                             } else {
-                                trace!("read event with no prior write");
+                                // No prior write means we have nothing to send
+                                // back. Log at INFO level so the absence of
+                                // data is visible when debugging communication
+                                // issues.
+                                info!("read request received with no stored write data");
                             }
                         } else {
                             trace!("Ignoring event: {}", typ);

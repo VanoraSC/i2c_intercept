@@ -1,10 +1,10 @@
-use serde_json::Value;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
+use serde_json::Value;
 use tracing::{error, info, trace, warn};
 
 /// Decode a hexadecimal string into a vector of bytes.
@@ -17,9 +17,7 @@ use tracing::{error, info, trace, warn};
 /// dependencies just for hex decoding.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     trace!("decode_hex len={}", s.len());
-    if s.len() % 2 != 0 {
-        return None;
-    }
+    if s.len() % 2 != 0 { return None; }
     let mut out = Vec::with_capacity(s.len() / 2);
     for i in 0..(s.len() / 2) {
         let byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
@@ -35,13 +33,11 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 /// as a hexadecimal string while echoing the frame back unmodified.
 ///
 /// In the default mode the redirect library sends newline separated JSON
-/// objects describing I²C activity. `write` events include a `data_hex` field
-/// containing the bytes transmitted by the original program. The tap server now
-/// remembers that payload and defers any response until a subsequent `read`
-/// event arrives. When a `read` is observed the server echoes the most recently
-/// written bytes back to the serial device, allowing the client to retrieve the
-/// data it previously supplied. Consecutive reads without an intervening write
-/// all receive the same stored payload.
+/// objects describing I²C activity.  For `write` events the JSON contains a
+/// `data_hex` field holding the transmitted bytes.  This server decodes the
+/// payload, logs the embedded timestamp and replies with the same eight bytes
+/// followed by an additional little-endian `u64` counter so client programs can
+/// verify that the round-trip occurred.
 fn main() -> io::Result<()> {
     // Initialize tracing so the tap server emits detailed execution logs.
     tracing_subscriber::fmt()
@@ -128,9 +124,9 @@ fn main() -> io::Result<()> {
             }
         } else {
             // In JSON mode the redirect library delivers newline separated
-            // objects describing I²C operations.  We parse each line and react
-            // to `write` and `read` events.  Write payloads are stored so a later
-            // read can retrieve them.
+            // objects describing I²C operations.  We parse each line and, when a
+            // `write` event is observed, decode the hexadecimal payload and
+            // craft a binary response.
 
             // Use a buffered reader for convenient line-based processing.  The
             // file descriptor is cloned so writes do not disturb the reader's
@@ -138,97 +134,48 @@ fn main() -> io::Result<()> {
             let reader = BufReader::new(file.try_clone()?);
             let mut writer = file;
             info!("Listening on {:?}...", path);
-
-            // Keep track of the most recent bytes supplied by a `write` command.
-            // When a `read` event is observed these bytes are echoed back to the
-            // serial port.
-            let mut last_write: Option<Vec<u8>> = None;
+            let mut counter: u64 = 0;
 
             for line in reader.lines() {
                 let line = match line {
                     Ok(l) => l,
-                    Err(e) => {
-                        error!("Read error: {}", e);
-                        break;
-                    }
+                    Err(e) => { error!("Read error: {}", e); break; }
                 };
                 let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
+                if trimmed.is_empty() { continue; }
 
                 match serde_json::from_str::<Value>(trimmed) {
                     Ok(v) => {
-                        // Determine the kind of event being reported and handle
-                        // only the `write` and `read` varieties. Any other type
-                        // is ignored but logged at the TRACE level for
-                        // diagnostics.
+                        // Only `write` events contain payload bytes that need to
+                        // be echoed back to the client. Other event types are
+                        // logged and ignored.
                         let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
                         if typ == "write" {
-                            // Decode the hexadecimal representation of the
-                            // payload and stash it so the next `read` event can
-                            // return the same bytes to the client.
                             if let Some(hex) = v.get("data_hex").and_then(|d| d.as_str()) {
                                 if let Some(bytes) = decode_hex(hex) {
-                                    trace!("stored {} byte write", bytes.len());
-                                    last_write = Some(bytes);
+                                    if bytes.len() >= 8 {
+                                        let secs = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                                        info!("Received: {}", secs);
+                                        let mut resp = Vec::with_capacity(16);
+                                        resp.extend_from_slice(&bytes[0..8]);
+                                        resp.extend_from_slice(&counter.to_le_bytes());
+                                        if let Err(e) = writer.write_all(&resp) { error!("Write error: {}", e); break; }
+                                        if let Err(e) = writer.flush() { error!("Flush error: {}", e); break; }
+                                        counter += 1;
+                                    } else {
+                                        warn!("write event too short");
+                                    }
                                 } else {
                                     warn!("invalid hex payload: {}", hex);
                                 }
-                            }
-                        } else if typ == "read" {
-                            // A read request asks for previously written data.
-                            // If we have such data available, echo it back to
-                            // the serial device. The optional `len` field limits
-                            // how many bytes are returned.
-                            if let Some(ref data) = last_write {
-                                let req_len = v
-                                    .get("len")
-                                    .and_then(|l| l.as_u64())
-                                    .map(|l| l as usize)
-                                    .unwrap_or(data.len());
-                                // Cap the response length to both the requested
-                                // amount and the number of bytes we actually
-                                // have available from the prior write.
-                                let resp_len = req_len.min(data.len());
-
-                                // Log the details of the read so developers can
-                                // easily trace interactions between the client
-                                // and tap server.
-                                info!(
-                                    "read request for {} bytes, returning {} bytes",
-                                    req_len, resp_len
-                                );
-                                trace!(
-                                    "read response bytes: {}",
-                                    data[..resp_len]
-                                        .iter()
-                                        .map(|b| format!("{:02x}", b))
-                                        .collect::<String>()
-                                );
-
-                                if let Err(e) = writer.write_all(&data[..resp_len]) {
-                                    error!("Write error: {}", e);
-                                    break;
-                                }
-                                if let Err(e) = writer.flush() {
-                                    error!("Flush error: {}", e);
-                                    break;
-                                }
-                            } else {
-                                // No prior write means we have nothing to send
-                                // back. Log at INFO level so the absence of
-                                // data is visible when debugging communication
-                                // issues.
-                                info!("read request received with no stored write data");
                             }
                         } else {
                             trace!("Ignoring event: {}", typ);
                         }
                     }
                     Err(_) => trace!("(raw) {}", trimmed),
-                }
             }
+        }
         }
 
         // If we exit the inner processing loop the peer has closed the

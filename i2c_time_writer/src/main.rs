@@ -5,7 +5,7 @@ use std::{
     io::{Read, Write},
     os::fd::AsRawFd,
     thread::sleep,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tracing::{error, info, trace, warn};
 
@@ -82,17 +82,32 @@ fn main() -> std::io::Result<()> {
         // tap server becomes unresponsive.
         let mut resp = [0u8; 16];
         let mut read = 0;
+        // Record when the response phase began so we can enforce a hard
+        // deadline on the read. Without this guard the loop could wait
+        // indefinitely if the device never produces data.
+        let start = Instant::now();
         while read < resp.len() {
-            // Wait up to one second for the file descriptor to become readable.
+            // If more than 500ms has elapsed with no full response, abandon the
+            // read so the main loop can continue and try again on the next
+            // iteration.
+            let elapsed = start.elapsed();
+            if elapsed >= Duration::from_millis(500) {
+                warn!("timed out waiting for response");
+                break;
+            }
+
+            // Wait only for the remaining time before the 500ms deadline for
+            // the file descriptor to become readable. This prevents a single
+            // poll call from blocking past the overall timeout.
+            let remaining = Duration::from_millis(500).saturating_sub(elapsed);
             let mut fds = pollfd {
                 fd,
                 events: POLLIN,
                 revents: 0,
             };
-            let ret = unsafe { libc::poll(&mut fds, 1, 1000) };
+            let ret = unsafe { libc::poll(&mut fds, 1, remaining.as_millis() as i32) };
             if ret == 0 {
-                // No data arrived within the timeout window; warn and abandon
-                // this iteration so the program does not block indefinitely.
+                // The device produced no data within the allotted window.
                 warn!("timed out waiting for response");
                 break;
             } else if ret < 0 {

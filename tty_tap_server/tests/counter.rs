@@ -67,6 +67,18 @@ fn echoes_with_counter() -> std::io::Result<()> {
         assert_eq!(counter, i);
     }
 
+    // Perform two reads without a preceding write. The server should still
+    // supply data so the reader does not block, returning only the monotonic
+    // counter value which continues to increment across reads.
+    for i in 3u64..5 {
+        writeln!(tty, "{{\"type\":\"read\",\"len\":8}}")?;
+        tty.flush()?;
+        let mut buf = vec![0u8; 8];
+        tty.read_exact(&mut buf)?;
+        let counter = u64::from_le_bytes(buf.try_into().unwrap());
+        assert_eq!(counter, i);
+    }
+
     // Terminate the server and clean up the pseudo device.
     let _ = server.kill();
     let _ = server.wait();

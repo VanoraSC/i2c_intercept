@@ -42,8 +42,10 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 /// written bytes back to the serial device and appends a monotonically
 /// increasing counter encoded as a little-endian `u64`. The counter allows test
 /// code to distinguish otherwise identical replies. After successfully serving a
-/// read the stored bytes are cleared so any further reads without a fresh write
-/// simply log that no data is available.
+/// read the stored bytes are cleared. Any later `read` without a fresh `write`
+/// still returns just the counter—padded or truncated to the requested length—so
+/// the client does not retry the read, and the absence of pending data is logged
+/// only once to avoid flooding the logs.
 fn main() -> io::Result<()> {
     // Initialize tracing so the tap server emits detailed execution logs.
     tracing_subscriber::fmt()
@@ -147,6 +149,12 @@ fn main() -> io::Result<()> {
             // also appended to each response so test harnesses can
             // differentiate otherwise identical transfers.
             let mut last_write: Option<Vec<u8>> = None;
+            // Track whether we've already warned about a read with no
+            // preceding write. Clients may poll repeatedly when waiting for a
+            // response and logging every poll would clutter the output. The
+            // flag is cleared whenever new data is written or a read is
+            // successfully serviced.
+            let mut logged_empty_read = false;
             // Number of `read` events we've successfully serviced. Starting at
             // zero keeps the first appended counter predictable for tests while
             // still ensuring uniqueness across reads.
@@ -180,6 +188,9 @@ fn main() -> io::Result<()> {
                                 if let Some(bytes) = decode_hex(hex) {
                                     trace!("stored {} byte write", bytes.len());
                                     last_write = Some(bytes);
+                                    // A new write means future reads should
+                                    // no longer report missing data.
+                                    logged_empty_read = false;
                                 } else {
                                     warn!("invalid hex payload: {}", hex);
                                 }
@@ -240,12 +251,40 @@ fn main() -> io::Result<()> {
                                 // without a fresh write visibly lack data.
                                 read_counter += 1;
                                 last_write = None;
+                                // A successful read means any later missing
+                                // data warning should be emitted again.
+                                logged_empty_read = false;
                             } else {
-                                // No prior write means we have nothing to send
-                                // back. Log at INFO level so the absence of
-                                // data is visible when debugging communication
-                                // issues.
-                                info!("read request received with no stored write data");
+                                // No prior write means we have nothing to echo
+                                // back. Still respond with the counter so the
+                                // client receives the number of bytes it
+                                // requested and does not retry the read.
+                                let req_len = v
+                                    .get("len")
+                                    .and_then(|l| l.as_u64())
+                                    .map(|l| l as usize)
+                                    .unwrap_or(0);
+                                let mut resp = read_counter.to_le_bytes().to_vec();
+                                if resp.len() < req_len {
+                                    resp.resize(req_len, 0);
+                                } else if resp.len() > req_len {
+                                    resp.truncate(req_len);
+                                }
+                                if let Err(e) = writer.write_all(&resp) {
+                                    error!("Write error: {}", e);
+                                    break;
+                                }
+                                if let Err(e) = writer.flush() {
+                                    error!("Flush error: {}", e);
+                                    break;
+                                }
+                                read_counter += 1;
+                                if !logged_empty_read {
+                                    info!("read request received with no stored write data");
+                                    logged_empty_read = true;
+                                } else {
+                                    trace!("read request received with no stored write data");
+                                }
                             }
                         } else {
                             trace!("Ignoring event: {}", typ);

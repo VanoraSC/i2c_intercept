@@ -75,10 +75,10 @@ fn main() -> io::Result<()> {
             println!("Listening on {:?} (raw)...", path);
             loop {
                 // Each frame begins with a three byte header: address, command
-                // and payload length. Any I/O error—including the device being
-                // unplugged—terminates the loop so the outer loop can
-                // re-establish the connection.
+                // and payload length. Trace the read so hangs are easier to
+                // diagnose if the device stops responding mid-frame.
                 let mut hdr = [0u8; 3];
+                println!("[tty] waiting for raw header");
                 if let Err(e) = reader.read_exact(&mut hdr) {
                     println!("Read error: {}", e);
                     break;
@@ -135,6 +135,7 @@ fn main() -> io::Result<()> {
                 };
                 let trimmed = line.trim();
                 if trimmed.is_empty() { continue; }
+                println!("[tty] received line: {}", trimmed);
 
                 match serde_json::from_str::<Value>(trimmed) {
                     Ok(v) => {

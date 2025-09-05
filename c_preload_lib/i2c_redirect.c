@@ -232,15 +232,29 @@ static void ensure_socket(void) {
  * process never blocks on slow or absent readers.  A single reconnection
  * attempt is made on connection related errors.
  */
-static void send_all_or_drop(const char *buf, size_t len) {
-    if (in_hook) return;
+/*
+ * Attempt to send the full buffer to the tap socket.  Historically any
+ * failure would be silently ignored which made it impossible for callers to
+ * determine that the proxy connection had died.  Returning an error allows the
+ * write hook to propagate the failure to the application so the hang can be
+ * attributed to the real culprit.
+ *
+ * The helper operates in a non‑blocking manner and will drop the remaining
+ * bytes if the socket cannot accept more data.  A negative return value
+ * indicates that nothing was transmitted.
+ */
+static int send_all_or_drop(const char *buf, size_t len) {
+    if (in_hook) return -1;
 
     /* Before attempting to send any data ensure the socat helper is alive so
      * external serial redirects remain functional. */
     ensure_socat();
 
     if (sock_fd < 0) ensure_socket();
-    if (sock_fd < 0) return;
+    if (sock_fd < 0) {
+        fprintf(stderr, "[i2c_redirect] no socket available; dropping frame\n");
+        return -1;
+    }
 
     ssize_t off = 0;
     while ((size_t)off < len) {
@@ -256,10 +270,15 @@ static void send_all_or_drop(const char *buf, size_t len) {
                 close(sock_fd);
                 sock_fd = -1;
                 ensure_socket();
-                if (sock_fd < 0) return; /* give up */
+                if (sock_fd < 0) {
+                    fprintf(stderr, "[i2c_redirect] reconnect failed: %s\n", strerror(errno));
+                    return -1; /* give up */
+                }
+                fprintf(stderr, "[i2c_redirect] reconnected tap socket\n");
                 continue; /* retry loop */
             } else {
-                return; /* cannot reconnect fd-from-env */
+                fprintf(stderr, "[i2c_redirect] socket error (fd-from-env): %s\n", strerror(errno));
+                return -1; /* cannot reconnect fd-from-env */
             }
         }
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -269,32 +288,35 @@ static void send_all_or_drop(const char *buf, size_t len) {
              * tracing tools which sacrifice data when the consumer falls
              * behind.
              */
-            return;
+            fprintf(stderr, "[i2c_redirect] send buffer full, dropping %zu bytes\n", len - off);
+            return -1;
         }
-        return; /* other error or zero write -> drop */
+        fprintf(stderr, "[i2c_redirect] send failed: %s\n", strerror(errno));
+        return -1; /* other error or zero write -> drop */
     }
+    return 0;
 }
 
 /* Emit a line of JSON, appending a newline if needed. */
-static void emit_json_line(const char *s) {
+static int emit_json_line(const char *s) {
     size_t len = strlen(s);
     if (len && s[len-1] == '\n') {
-        send_all_or_drop(s, len);
+        return send_all_or_drop(s, len);
     } else {
-        send_all_or_drop(s, len);
-        send_all_or_drop("\n", 1);
+        if (send_all_or_drop(s, len) < 0) return -1;
+        return send_all_or_drop("\n", 1);
     }
 }
 
 /* printf-style helper that formats a JSON line and sends it. */
-static void emitf(const char *fmt, ...) __attribute__((format(printf,1,2)));
-static void emitf(const char *fmt, ...) {
+static int emitf(const char *fmt, ...) __attribute__((format(printf,1,2)));
+static int emitf(const char *fmt, ...) {
     char buf[65536];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    emit_json_line(buf);
+    return emit_json_line(buf);
 }
 
 /*
@@ -304,17 +326,16 @@ static void emitf(const char *fmt, ...) {
  * single byte.  This mirrors the framing used by the serial tap helpers so the
  * receive side can forward the data without additional parsing.
  */
-static void emit_raw_frame(int addr, int cmd, const unsigned char *data,
-                           size_t len) {
+static int emit_raw_frame(int addr, int cmd, const unsigned char *data,
+                          size_t len) {
     unsigned char hdr[3];
     if (len > 255) len = 255;
     hdr[0] = (unsigned char)addr;
     hdr[1] = (unsigned char)cmd;
     hdr[2] = (unsigned char)len;
-    send_all_or_drop((const char *)hdr, sizeof(hdr));
-    if (len > 0) {
-        send_all_or_drop((const char *)data, len);
-    }
+    if (send_all_or_drop((const char *)hdr, sizeof(hdr)) < 0) return -1;
+    if (len > 0 && send_all_or_drop((const char *)data, len) < 0) return -1;
+    return 0;
 }
 
 // --- JSON logging helpers -------------------------------------------------
@@ -328,71 +349,71 @@ static void emit_raw_frame(int addr, int cmd, const unsigned char *data,
 
 /* Emit an \"open\" event describing the file descriptor and path. */
 static void log_open_event(int fd, const char *path) {
-    emitf("{\"type\":\"open\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"path\":\"%s\"}",
-          getpid(), now_ns(), fd, path);
+    (void)emitf("{\"type\":\"open\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"path\":\"%s\"}",
+                getpid(), now_ns(), fd, path);
 }
 
 /* Emit a \"close\" event when an I\u00b2C descriptor is closed. */
 static void log_close_event(int fd) {
-    emitf("{\"type\":\"close\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d}",
-          getpid(), now_ns(), fd);
+    (void)emitf("{\"type\":\"close\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d}",
+                getpid(), now_ns(), fd);
 }
 
 /* Emit a \"write\" event including optional data payload. */
-static void log_write_event(int fd, int addr, size_t len,
-                            const char *data_hex, int truncated) {
-    emitf("{\"type\":\"write\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%d,\"len\":%zu,\"data_hex\":\"%s\"}%s",
-          getpid(), now_ns(), fd, addr, len, data_hex,
-          (truncated ? " /*truncated*/" : ""));
+static int log_write_event(int fd, int addr, size_t len,
+                           const char *data_hex, int truncated) {
+    return emitf("{\"type\":\"write\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%d,\"len\":%zu,\"data_hex\":\"%s\"}%s",
+                 getpid(), now_ns(), fd, addr, len, data_hex,
+                 (truncated ? " /*truncated*/" : ""));
 }
 
 /* Emit header line for an I2C_RDWR ioctl event. */
 static void log_rdwr_start(int fd, int nmsgs, long long ts) {
-    emitf("{\"type\":\"ioctl_rdwr\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"nmsgs\":%d,\"detail\":[",
-          getpid(), ts, fd, nmsgs);
+    (void)emitf("{\"type\":\"ioctl_rdwr\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"nmsgs\":%d,\"detail\":[",
+                getpid(), ts, fd, nmsgs);
 }
 
 /* Emit a single message element within an I2C_RDWR ioctl event. */
 static void log_rdwr_msg(int idx, const struct i2c_msg *m, int last) {
-    emitf("{\"idx\":%d,\"addr\":%u,\"flags\":%u,\"len\":%u,", idx, m->addr, m->flags, m->len);
+    (void)emitf("{\"idx\":%d,\"addr\":%u,\"flags\":%u,\"len\":%u,", idx, m->addr, m->flags, m->len);
     if (m->flags & I2C_M_RD) {
-        emitf("\"dir\":\"read\"}%s", (last ? "" : ","));
+        (void)emitf("\"dir\":\"read\"}%s", (last ? "" : ","));
     } else {
         size_t take = m->len > 8192 ? 8192 : m->len;
         char *hex = malloc(take*2 + 1);
         if (hex) {
             hex_encode(hex, (const unsigned char*)m->buf, take);
-            emitf("\"dir\":\"write\",\"data_hex\":\"%s\"}%s", hex, (last ? "" : ","));
+            (void)emitf("\"dir\":\"write\",\"data_hex\":\"%s\"}%s", hex, (last ? "" : ","));
             free(hex);
         } else {
-            emitf("\"dir\":\"write\",\"data_hex\":\"\"}%s", (last ? "" : ","));
+            (void)emitf("\"dir\":\"write\",\"data_hex\":\"\"}%s", (last ? "" : ","));
         }
     }
 }
 
 /* Terminate an I2C_RDWR ioctl event. */
 static void log_rdwr_end(void) {
-    emitf("]}");
+    (void)emitf("]}");
 }
 
 /* Emit an event describing a slave address change ioctl. */
 static void log_ioctl_set_slave(int fd, unsigned long addr, int force) {
-    emitf("{\"type\":\"ioctl_set_slave\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%lu,\"force\":%s}",
-          getpid(), now_ns(), fd, addr, (force ? "true" : "false"));
+    (void)emitf("{\"type\":\"ioctl_set_slave\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%lu,\"force\":%s}",
+                getpid(), now_ns(), fd, addr, (force ? "true" : "false"));
 }
 
 /* Emit an event describing a generic SMBus ioctl. */
 static void log_ioctl_smbus(int fd, const struct i2c_smbus_ioctl_data *sd) {
-    emitf("{\"type\":\"ioctl_smbus\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"read\":%s,\"command\":%u,\"size\":%u}",
-          getpid(), now_ns(), fd,
-          (sd->read_write == I2C_SMBUS_READ ? "true" : "false"),
-          sd->command, sd->size);
+    (void)emitf("{\"type\":\"ioctl_smbus\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"read\":%s,\"command\":%u,\"size\":%u}",
+                getpid(), now_ns(), fd,
+                (sd->read_write == I2C_SMBUS_READ ? "true" : "false"),
+                sd->command, sd->size);
 }
 
 /* Emit an event for any other ioctl commands that are not specially handled. */
 static void log_ioctl_other(int fd, unsigned long req) {
-    emitf("{\"type\":\"ioctl_other\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"req\":%lu}",
-          getpid(), now_ns(), fd, req);
+    (void)emitf("{\"type\":\"ioctl_other\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"req\":%lu}",
+                getpid(), now_ns(), fd, req);
 }
 
 // --- init
@@ -582,9 +603,10 @@ ssize_t write(int fd, const void *buf, size_t count) {
         int addr = -1;
         if (fd >= 0 && fd < FD_LIMIT) addr = atomic_load(&current_addr[fd]);
 
+        int err = 0;
         if (raw_mode) {
             /* In raw mode forward the payload as a binary frame. */
-            emit_raw_frame(addr, 0, (const unsigned char *)buf, count);
+            err = emit_raw_frame(addr, 0, (const unsigned char *)buf, count);
         } else {
             /* Otherwise log the transfer as JSON with a hex encoded body. */
             const size_t max_dump = 8192;
@@ -592,9 +614,17 @@ ssize_t write(int fd, const void *buf, size_t count) {
             char *hex = malloc(n * 2 + 1);
             if (hex) {
                 hex_encode(hex, (const unsigned char *)buf, n);
-                log_write_event(fd, addr, count, hex, (count>max_dump));
+                err = log_write_event(fd, addr, count, hex, (count>max_dump));
                 free(hex);
+            } else {
+                err = -1;
             }
+        }
+        if (err < 0) {
+            /* Surface failures to the caller so the hang location is obvious. */
+            errno = EIO;
+            fprintf(stderr, "[i2c_redirect] write hook reporting EIO\n");
+            return -1;
         }
         if (!passthrough) return (ssize_t)count;
     }

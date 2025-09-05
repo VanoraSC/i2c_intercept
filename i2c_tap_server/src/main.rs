@@ -19,6 +19,7 @@ fn handle_client(stream: UnixStream) -> io::Result<()> {
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() { continue; }
+        println!("[tap] received: {}", line); // trace incoming payload
         match serde_json::from_str::<Value>(&line) {
             Ok(v) => {
                 let typ = v.get("type").and_then(|t| t.as_str()).unwrap_or("unknown");
@@ -37,16 +38,20 @@ fn handle_client(stream: UnixStream) -> io::Result<()> {
 fn handle_client_raw(mut stream: UnixStream) -> io::Result<()> {
     loop {
         let mut hdr = [0u8; 3];
+        println!("[tap] waiting for raw header");
         if let Err(e) = stream.read_exact(&mut hdr) {
             // EOF is expected when the client disconnects.
             if e.kind() != io::ErrorKind::UnexpectedEof { return Err(e); }
+            println!("[tap] client closed connection");
             break;
         }
         let addr = hdr[0];
         let cmd = hdr[1];
         let len = hdr[2] as usize;
         let mut data = vec![0u8; len];
-        stream.read_exact(&mut data)?;
+        if let Err(e) = stream.read_exact(&mut data) {
+            return Err(e);
+        }
         let dir = if cmd == 0 { "write" } else { "read" };
         let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
         println!("{} addr=0x{:02x} len={} data={}", dir, addr, len, hex);
@@ -82,6 +87,7 @@ fn main() -> io::Result<()> {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
+                println!("Accepted new connection");
                 let is_raw = raw_mode;
                 thread::spawn(move || {
                     let result = if is_raw {
@@ -92,6 +98,7 @@ fn main() -> io::Result<()> {
                     if let Err(e) = result {
                         eprintln!("client error: {}", e);
                     }
+                    println!("Client handler exiting");
                 });
             }
             Err(e) => eprintln!("accept error: {}", e),

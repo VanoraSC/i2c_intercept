@@ -7,6 +7,7 @@ use std::{
     thread::sleep,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use libc::{poll, pollfd, POLLIN};
 
 // Constant from linux/i2c-dev.h used to select the target I²C slave.
 const I2C_SLAVE: c_ulong = 0x0703;
@@ -55,29 +56,51 @@ fn main() -> std::io::Result<()> {
         // raw bytes keeps the wire format compact and unambiguous.
         let bytes = secs.to_le_bytes();
 
+        // Emit trace output before each write so hangs can be correlated with
+        // the exact operation in progress.
+        println!("Writing timestamp {}", secs);
+
         // Write the 8-byte timestamp to the I²C device. `write_all` blocks until
         // all bytes have been transmitted so the reader sees a complete value.
         file.write_all(&bytes)?;
 
-        // The tap server responds with the same eight bytes followed by an
-        // additional eight-byte counter. Use `read_exact` so that partial reads
-        // are retried until the full 16‑byte packet is received or an error
-        // occurs.
+        // After the write the tap server should echo the timestamp and append
+        // a counter. We poll with a timeout so a missing response does not block
+        // forever.
         let mut resp = [0u8; 16];
-        match file.read_exact(&mut resp) {
-            Ok(_) => {
-                // Split the response into the echoed timestamp and the counter
-                // portion. Converting with `from_le_bytes` yields the native
-                // `u64` values for display and further processing.
-                let echoed = u64::from_le_bytes(resp[0..8].try_into().unwrap());
-                let counter = u64::from_le_bytes(resp[8..16].try_into().unwrap());
-                println!("Read back: {} (counter {})", echoed, counter);
+        let mut off = 0usize;
+        println!("Waiting for response...");
+        while off < resp.len() {
+            let mut pfd = pollfd { fd, events: POLLIN, revents: 0 };
+            let ret = unsafe { poll(&mut pfd, 1, 1000) }; // 1s timeout
+            if ret <= 0 {
+                if ret == 0 {
+                    eprintln!("read timeout after {} bytes", off);
+                } else {
+                    eprintln!("poll error: {}", std::io::Error::last_os_error());
+                }
+                break;
             }
-            Err(e) => {
-                // Report any I/O failure but continue looping so that a transient
-                // error does not permanently stop the writer.
-                eprintln!("read error: {}", e);
+            match file.read(&mut resp[off..]) {
+                Ok(0) => {
+                    eprintln!("EOF after {} bytes", off);
+                    break;
+                }
+                Ok(n) => off += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => {
+                    eprintln!("read error: {}", e);
+                    break;
+                }
             }
+        }
+        if off == resp.len() {
+            // Split the response into the echoed timestamp and the counter
+            // portion. Converting with `from_le_bytes` yields the native
+            // `u64` values for display and further processing.
+            let echoed = u64::from_le_bytes(resp[0..8].try_into().unwrap());
+            let counter = u64::from_le_bytes(resp[8..16].try_into().unwrap());
+            println!("Read back: {} (counter {})", echoed, counter);
         }
 
         sleep(Duration::from_secs(1));

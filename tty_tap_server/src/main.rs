@@ -36,12 +36,14 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 ///
 /// In the default mode the redirect library sends newline separated JSON
 /// objects describing I²C activity. `write` events include a `data_hex` field
-/// containing the bytes transmitted by the original program. The tap server now
+/// containing the bytes transmitted by the original program. The tap server
 /// remembers that payload and defers any response until a subsequent `read`
 /// event arrives. When a `read` is observed the server echoes the most recently
-/// written bytes back to the serial device, allowing the client to retrieve the
-/// data it previously supplied. Consecutive reads without an intervening write
-/// all receive the same stored payload.
+/// written bytes back to the serial device and appends a monotonically
+/// increasing counter encoded as a little-endian `u64`. The counter allows test
+/// code to distinguish otherwise identical replies. After successfully serving a
+/// read the stored bytes are cleared so any further reads without a fresh write
+/// simply log that no data is available.
 fn main() -> io::Result<()> {
     // Initialize tracing so the tap server emits detailed execution logs.
     tracing_subscriber::fmt()
@@ -139,10 +141,16 @@ fn main() -> io::Result<()> {
             let mut writer = file;
             info!("Listening on {:?}...", path);
 
-            // Keep track of the most recent bytes supplied by a `write` command.
-            // When a `read` event is observed these bytes are echoed back to the
-            // serial port.
+            // Keep track of the most recent bytes supplied by a `write`
+            // command. When a `read` event is observed these bytes are echoed
+            // back to the serial port. A monotonically increasing counter is
+            // also appended to each response so test harnesses can
+            // differentiate otherwise identical transfers.
             let mut last_write: Option<Vec<u8>> = None;
+            // Number of `read` events we've successfully serviced. Starting at
+            // zero keeps the first appended counter predictable for tests while
+            // still ensuring uniqueness across reads.
+            let mut read_counter: u64 = 0;
 
             for line in reader.lines() {
                 let line = match line {
@@ -187,27 +195,38 @@ fn main() -> io::Result<()> {
                                     .and_then(|l| l.as_u64())
                                     .map(|l| l as usize)
                                     .unwrap_or(data.len());
-                                // Cap the response length to both the requested
-                                // amount and the number of bytes we actually
-                                // have available from the prior write.
-                                let resp_len = req_len.min(data.len());
+
+                                // Build the response from the stored bytes
+                                // followed by the current read counter encoded
+                                // as little-endian. The redirect library
+                                // expects replies of *exactly* the requested
+                                // length; pad with zeros or truncate as
+                                // necessary so the client never blocks waiting
+                                // for additional data.
+                                let mut resp = data.clone();
+                                resp.extend_from_slice(&read_counter.to_le_bytes());
+                                if resp.len() < req_len {
+                                    resp.resize(req_len, 0);
+                                } else if resp.len() > req_len {
+                                    resp.truncate(req_len);
+                                }
 
                                 // Log the details of the read so developers can
                                 // easily trace interactions between the client
                                 // and tap server.
                                 info!(
                                     "read request for {} bytes, returning {} bytes",
-                                    req_len, resp_len
+                                    req_len,
+                                    resp.len()
                                 );
                                 trace!(
                                     "read response bytes: {}",
-                                    data[..resp_len]
-                                        .iter()
+                                    resp.iter()
                                         .map(|b| format!("{:02x}", b))
                                         .collect::<String>()
                                 );
 
-                                if let Err(e) = writer.write_all(&data[..resp_len]) {
+                                if let Err(e) = writer.write_all(&resp) {
                                     error!("Write error: {}", e);
                                     break;
                                 }
@@ -215,6 +234,12 @@ fn main() -> io::Result<()> {
                                     error!("Flush error: {}", e);
                                     break;
                                 }
+
+                                // Increment the counter for the next read and
+                                // clear the stored write so repeated reads
+                                // without a fresh write visibly lack data.
+                                read_counter += 1;
+                                last_write = None;
                             } else {
                                 // No prior write means we have nothing to send
                                 // back. Log at INFO level so the absence of

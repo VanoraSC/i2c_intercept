@@ -108,12 +108,18 @@ static unsigned char exempt_addrs[1024];
 static void parse_exempt_env(void) {
     const char *list = getenv("I2C_REDIRECT_EXEMPT");
     if (!list || !*list) return;
-    char *copy = strdup(list);
+    char *copy = strdup(list);             /* strtok_r() needs a writable copy */
     char *tok, *save = NULL;
     for (tok = strtok_r(copy, ", ", &save); tok; tok = strtok_r(NULL, ", ", &save)) {
-        long v = strtol(tok, NULL, 0);
-        if (v >= 0 && v < (long)(sizeof(exempt_addrs) / sizeof(exempt_addrs[0]))) {
-            exempt_addrs[v] = 1;
+        int base = 10;                     /* decimal unless prefixed by 0x */
+        if (tok[0] == '0' && (tok[1] == 'x' || tok[1] == 'X')) {
+            base = 16;
+        }
+        char *end;
+        long v = strtol(tok, &end, base);  /* parse the token into an address */
+        if (*end == '\0' &&
+            v >= 0 && v < (long)(sizeof(exempt_addrs) / sizeof(exempt_addrs[0]))) {
+            exempt_addrs[v] = 1;           /* mark address as exempt when valid */
         }
     }
     free(copy);

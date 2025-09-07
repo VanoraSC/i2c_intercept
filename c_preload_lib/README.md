@@ -26,7 +26,8 @@ defaults when they are unset:
 - `I2C_SOCAT_SOCKET` – socket path used by the `socat` helper (default:
   `/tmp/ttyS22.tap.sock`)
 - `I2C_REDIRECT_EXEMPT` – comma separated list of I²C addresses that should
-  bypass the redirect and talk to hardware directly (default: none)
+  bypass the redirect and talk to hardware directly (default: none). Addresses
+  may be given in decimal or prefixed with `0x` for hexadecimal.
 
 ### Data format
 

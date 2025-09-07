@@ -95,6 +95,38 @@ static unsigned char raw_read_buf[256];
 static size_t raw_read_len = 0;
 static size_t raw_read_off = 0;
 
+/*
+ * Table of I²C addresses that should bypass the redirect logic.  Each index
+ * corresponds to a 7‑ or 10‑bit address and is set when the address appears in
+ * the comma separated list provided via the I2C_REDIRECT_EXEMPT environment
+ * variable.  Addresses marked here are passed through to the real kernel I²C
+ * implementation instead of being forwarded to the proxy socket.
+ */
+static unsigned char exempt_addrs[1024];
+
+/* Parse the I2C_REDIRECT_EXEMPT environment variable into the lookup table. */
+static void parse_exempt_env(void) {
+    const char *list = getenv("I2C_REDIRECT_EXEMPT");
+    if (!list || !*list) return;
+    char *copy = strdup(list);
+    char *tok, *save = NULL;
+    for (tok = strtok_r(copy, ", ", &save); tok; tok = strtok_r(NULL, ", ", &save)) {
+        long v = strtol(tok, NULL, 0);
+        if (v >= 0 && v < (long)(sizeof(exempt_addrs) / sizeof(exempt_addrs[0]))) {
+            exempt_addrs[v] = 1;
+        }
+    }
+    free(copy);
+}
+
+/* Return non‑zero when the given address should bypass the redirect. */
+static int is_exempt_addr(int addr) {
+    if (addr >= 0 && addr < (int)(sizeof(exempt_addrs) / sizeof(exempt_addrs[0]))) {
+        return exempt_addrs[addr] != 0;
+    }
+    return 0;
+}
+
 /* Resolve the real libc symbol addresses the first time we need them. */
 static void ensure_resolved(void) {
     if (real_open && real_open64 && real_openat && real_read && real_write &&
@@ -331,7 +363,8 @@ static void emit_raw_frame(int addr, int cmd, const unsigned char *data,
 __attribute__((constructor))
 static void init_i2c_redirect(void) {
     ensure_resolved();
-
+    /* Populate the address exclusion table before any I²C traffic occurs. */
+    parse_exempt_env();
 
     const char *fd_str = getenv("I2C_PROXY_SOCK_FD");
     if (fd_str && *fd_str) {
@@ -488,6 +521,11 @@ ssize_t read(int fd, void *buf, size_t count) {
     ssize_t r = 0;
 
     if (is_marked_i2c(fd)) {
+        int addr = -1;
+        if (fd >= 0 && fd < FD_LIMIT) addr = atomic_load(&current_addr[fd]);
+        if (is_exempt_addr(addr)) {
+            in_hook++; r = real_read(fd, buf, count); in_hook--; goto out;
+        }
         /* Pull data from the proxy socket instead of real hardware.  This
          * mirrors the behavior of the write hook which pushes traffic out on
          * the same connection.  If no socket is available return EOF so the
@@ -554,6 +592,12 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
 
     for (nfds_t i = 0; i < nfds; i++) {
         if (is_marked_i2c(fds[i].fd)) {
+            int addr = -1;
+            if (fds[i].fd >= 0 && fds[i].fd < FD_LIMIT)
+                addr = atomic_load(&current_addr[fds[i].fd]);
+            if (is_exempt_addr(addr)) {
+                return real_poll(fds, nfds, timeout);
+            }
             ensure_socat();
             if (sock_fd < 0) ensure_socket();
             if (sock_fd < 0) {
@@ -586,7 +630,9 @@ ssize_t write(int fd, const void *buf, size_t count) {
     if (is_marked_i2c(fd)) {
         int addr = -1;
         if (fd >= 0 && fd < FD_LIMIT) addr = atomic_load(&current_addr[fd]);
-
+        if (is_exempt_addr(addr)) {
+            in_hook++; r = real_write(fd, buf, count); in_hook--; goto out;
+        }
         /* Forward the payload as a binary frame. */
         emit_raw_frame(addr, 0, (const unsigned char *)buf, count);
         r = (ssize_t)count;
@@ -624,7 +670,13 @@ int ioctl(int fd, unsigned long req, ...) {
         unsigned long addr = va_arg(ap, unsigned long);
         va_end(ap);
         if (fd >= 0 && fd < FD_LIMIT) atomic_store(&current_addr[fd], (int)addr);
-        /* Always pretend success so client code continues to run. */
+        if (is_exempt_addr((int)addr)) {
+            in_hook++;
+            int r = real_ioctl(fd, req, addr);
+            in_hook--;
+            return r;
+        }
+        /* Suppress the real call for redirected addresses. */
         return 0;
     }
 
@@ -632,6 +684,16 @@ int ioctl(int fd, unsigned long req, ...) {
         struct i2c_rdwr_ioctl_data *d = va_arg(ap, struct i2c_rdwr_ioctl_data *);
         va_end(ap);
         if (d) {
+            bool all_exempt = true;
+            for (int i = 0; i < (int)d->nmsgs; i++) {
+                if (!is_exempt_addr(d->msgs[i].addr)) { all_exempt = false; break; }
+            }
+            if (all_exempt) {
+                in_hook++;
+                int r = real_ioctl(fd, req, d);
+                in_hook--;
+                return r;
+            }
             /* Send each message as a binary frame to mirror on-the-wire traffic. */
             for (int i = 0; i < (int)d->nmsgs; i++) {
                 struct i2c_msg *m = &d->msgs[i];

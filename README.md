@@ -48,6 +48,8 @@ the following environment variables before launching the target application:
   `/tmp/ttyS22.tap.sock`).
 * `I2C_PROXY_SOCK` – socket the preload library connects to (default:
   `/tmp/ttyS22.tap.sock`).
+* `I2C_REDIRECT_EXEMPT` – comma separated list of I²C addresses that should
+  bypass the redirect and access hardware directly.
 
 These variables are optional; the preload library uses the defaults when they
 are unset. The helper process is automatically terminated when the library is

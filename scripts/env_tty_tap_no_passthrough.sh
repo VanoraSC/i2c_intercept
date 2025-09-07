@@ -7,8 +7,10 @@
 # This script should be sourced to modify the current shell environment.  It
 # sets:
 #   I2C_SOCAT_TTY      - Serial device to bridge (default: /dev/ttyS22)
-#   I2C_SOCAT_SOCKET   - Unix socket used by the socat helper
-#   I2C_PROXY_SOCK     - Socket the preload library connects to
+#   I2C_SOCAT_SOCKET   - Unix socket used by the socat helper (default:
+#                        /tmp/ttyS22.tap.sock)
+#   I2C_PROXY_SOCK     - Socket the preload library connects to (default:
+#                        /tmp/ttyS22.tap.sock)
 #   LD_PRELOAD         - Path to the preload library
 # If the chosen serial device does not exist a background `socat` process is
 # started to create it.  Passthrough support has been removed so intercepted

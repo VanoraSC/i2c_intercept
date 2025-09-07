@@ -3,9 +3,8 @@
 This repository contains a collection of tools for intercepting and manipulating I²C traffic.  The project includes:
 
 - **c_preload_lib** – a shared library used to intercept I²C operations via LD_PRELOAD
-- **tty_tap_server** – a Rust server that listens on a serial TTY, logs eight-byte timestamp packets, and echoes them back with a counter (with optional raw-frame support)
-- **i2c_tap_server** – a Rust server that streams captured bus data
-- **i2c_time_writer** – a Rust utility that inserts timing information into the I²C stream
+- **tty_tap_server** – a Rust server that listens on a serial TTY, logs raw I²C write commands and fulfills read requests with a counter value
+- **i2c_time_writer** – a Rust utility that periodically writes the current time and issues matching read requests
 
 ## Building
 
@@ -15,7 +14,7 @@ The top-level `Makefile` builds all components in one step.  From the repository
 make
 ```
 
-This compiles the C preload library and the Rust utilities `tty_tap_server`, `i2c_tap_server`, and `i2c_time_writer`.
+This compiles the C preload library and the Rust utilities `tty_tap_server` and `i2c_time_writer`.
 
 ### Cross-compiling for aarch64
 
@@ -44,12 +43,17 @@ When using the `c_preload_lib` you can have it automatically start a
 is invoked from `/media/data/socat`, so that binary must be present. Configure
 the following environment variables before launching the target application:
 
-* `I2C_SOCAT_TTY` – path of the serial device (e.g. `/dev/ttyS22`).
-* `I2C_SOCAT_SOCKET` – Unix socket path for the `socat` listener. Defaults to
-  `/tmp/ttyS22.tap.sock` if unset.
+* `I2C_SOCAT_TTY` – path of the serial device (default: `/dev/ttyS22`).
+* `I2C_SOCAT_SOCKET` – Unix socket path for the `socat` listener (default:
+  `/tmp/ttyS22.tap.sock`).
+* `I2C_PROXY_SOCK` – socket the preload library connects to (default:
+  `/tmp/ttyS22.tap.sock`).
+* `I2C_REDIRECT_EXEMPT` – comma separated list of I²C addresses that should
+  bypass the redirect and access hardware directly. Addresses may be given in
+  decimal or prefixed with `0x` for hexadecimal.
 
-Set `I2C_PROXY_SOCK` to the same socket so the preload library connects to the
-bridge. The helper process is automatically terminated when the library is
+These variables are optional; the preload library uses the defaults when they
+are unset. The helper process is automatically terminated when the library is
 unloaded.
 
 ## Testing with `tty_tap_server` and `i2c_time_writer`
@@ -62,18 +66,17 @@ serial device `/dev/ttyS22`:
 ./tty_tap_server/target/release/tty_tap_server
 ```
 
-In a second terminal run the time writer with the preload library and the
-environment variables that enable the built‑in `socat` bridge:
+In a second terminal run the time writer with the preload library:
 
 ```bash
 LD_PRELOAD=./c_preload_lib/libi2c_redirect.so \
-I2C_SOCAT_TTY=/dev/ttyS22 I2C_SOCAT_SOCKET=/tmp/ttyS22.tap.sock \
-I2C_PROXY_SOCK=/tmp/ttyS22.tap.sock \
 ./i2c_time_writer/target/release/i2c_time_writer /dev/i2c-1 0x50
 ```
 
 The time writer sends the current Unix timestamp once per second as an
-eight-byte little-endian value. The tap server echoes the same bytes back and
-appends an eight-byte counter, which the time writer prints to its standard
-output.
+eight-byte little-endian value and then issues an I²C read command requesting
+eight bytes. The tap server logs the write, records the read request and
+responds with a little-endian counter. The time writer prints the returned
+counter to its standard output. Override `I2C_SOCAT_TTY`,
+`I2C_SOCAT_SOCKET` or `I2C_PROXY_SOCK` if different paths are needed.
 

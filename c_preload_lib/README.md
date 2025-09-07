@@ -13,16 +13,28 @@ make CROSS_COMPILE=aarch64-linux-gnu-
 
 Run:
 ```bash
-export I2C_PROXY_SOCK=/tmp/i2c.tap.sock
 export LD_PRELOAD=$PWD/libi2c_redirect.so
 your_i2c_program
 ```
 
-### Raw mode
+The library consults several environment variables but falls back to sensible
+defaults when they are unset:
 
-Set `I2C_PROXY_RAW=1` to emit binary `[addr][cmd][len][data...]` frames instead
-of JSON lines. Tools consuming the stream must also enable raw mode to interpret
-the framing correctly.
+- `I2C_PROXY_SOCK` – Unix socket used to communicate with the tap server
+  (default: `/tmp/ttyS22.tap.sock`)
+- `I2C_SOCAT_TTY` – serial device bridged by the helper (default: `/dev/ttyS22`)
+- `I2C_SOCAT_SOCKET` – socket path used by the `socat` helper (default:
+  `/tmp/ttyS22.tap.sock`)
+- `I2C_REDIRECT_EXEMPT` – comma separated list of I²C addresses that should
+  bypass the redirect and talk to hardware directly (default: none). Addresses
+  may be given in decimal or prefixed with `0x` for hexadecimal.
+
+### Data format
+
+The library always emits binary `[addr][cmd][len][data...]` frames. Tools
+consuming the stream must interpret the framing accordingly. For read requests
+(`cmd == 1`) no payload bytes follow and `len` conveys the number of bytes the
+caller expects to read in response.
 
 ### Optional serial forwarding via socat
 
@@ -33,9 +45,9 @@ socket to a serial TTY.  The helper is executed from the fixed path
 socket used by the helper:
 
 ```bash
-export I2C_SOCAT_TTY=/dev/ttyS22            # serial device to bridge
-export I2C_SOCAT_SOCKET=/tmp/ttyS22.tap.sock   # optional, defaults to /tmp/ttyS22.tap.sock
-export I2C_PROXY_SOCK=$I2C_SOCAT_SOCKET     # socket used by the preload library
+# The following exports are optional; the shown values are the defaults.
+export I2C_SOCAT_TTY=/dev/ttyS22
+export I2C_SOCAT_SOCKET=/tmp/ttyS22.tap.sock
 export LD_PRELOAD=$PWD/libi2c_redirect.so
 your_i2c_program
 ```

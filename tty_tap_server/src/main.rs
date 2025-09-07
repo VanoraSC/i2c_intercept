@@ -1,9 +1,44 @@
 use std::fs::OpenOptions;
 use std::io::{self, BufReader, Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use tracing::{error, info};
+use libc::{F_GETFL, F_SETFL, O_NONBLOCK};
+
+/// Read and discard any pending bytes from the provided serial device.
+///
+/// When the tap server reconnects to the proxy TTY there may be leftover
+/// traffic from a previous run sitting in the kernel's buffer. This helper
+/// drains all currently available data in a non-blocking fashion so the server
+/// starts with a clean slate.
+fn drain_stale(file: &mut std::fs::File) -> io::Result<()> {
+    let fd = file.as_raw_fd();
+
+    // Temporarily place the descriptor into non-blocking mode so `read` calls
+    // return immediately when no data is present.
+    let flags = unsafe { libc::fcntl(fd, F_GETFL, 0) };
+    unsafe {
+        libc::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    let mut buf = [0u8; 1024];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,               // End of file: nothing more to drain.
+            Ok(_) => continue,            // Keep draining until buffer is empty.
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+    }
+
+    // Restore the original descriptor flags so subsequent I/O blocks as usual.
+    unsafe {
+        libc::fcntl(fd, F_SETFL, flags);
+    }
+    Ok(())
+}
 
 /// Connect to `/dev/ttyS22`, proxy raw I²C frames and maintain a counter.
 ///
@@ -26,7 +61,7 @@ fn main() -> io::Result<()> {
     // Run indefinitely, reconnecting if the device disappears or I/O fails.
     loop {
         // Wait for the device node to exist and open it for read/write.
-        let file = loop {
+        let mut file = loop {
             match OpenOptions::new().read(true).write(true).open(&path) {
                 Ok(f) => break f,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -37,6 +72,10 @@ fn main() -> io::Result<()> {
                 Err(e) => return Err(e),
             }
         };
+
+        // Clear any stale bytes that may be lingering in the device buffer from
+        // a previous run before establishing the reader and writer handles.
+        drain_stale(&mut file)?;
 
         let mut reader = BufReader::new(file.try_clone()?);
         let mut writer = file;

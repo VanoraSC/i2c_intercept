@@ -76,6 +76,20 @@ fn main() -> std::io::Result<()> {
         }
     }
 
+    // Drain any bytes that might remain in the proxy socket from a previous
+    // run. Leaving stale frames in the buffer would cause the first iteration
+    // of the loop below to process outdated data, so the entire available
+    // buffer is read and discarded before proceeding.
+    let mut discard = [0u8; 64];
+    loop {
+        match file.read(&mut discard) {
+            Ok(0) => break, // No more data to drain.
+            Ok(_) => continue, // Keep reading until the buffer is empty.
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(e),
+        }
+    }
+
     // Every second the program writes the current timestamp to the I²C device
     // and then issues a read request for eight bytes. The tap server logs the
     // write in human readable form and replies to the read with a little-endian

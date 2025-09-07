@@ -4,3 +4,4 @@ i2c_time_writer/target
 tty_tap_server/target
 
 *.so
+static_proxy_fixture/target

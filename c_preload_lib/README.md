@@ -13,10 +13,18 @@ make CROSS_COMPILE=aarch64-linux-gnu-
 
 Run:
 ```bash
-export I2C_PROXY_SOCK=/tmp/i2c.tap.sock
 export LD_PRELOAD=$PWD/libi2c_redirect.so
 your_i2c_program
 ```
+
+The library consults several environment variables but falls back to sensible
+defaults when they are unset:
+
+- `I2C_PROXY_SOCK` – Unix socket used to communicate with the tap server
+  (default: `/tmp/ttyS22.tap.sock`)
+- `I2C_SOCAT_TTY` – serial device bridged by the helper (default: `/dev/ttyS22`)
+- `I2C_SOCAT_SOCKET` – socket path used by the `socat` helper (default:
+  `/tmp/ttyS22.tap.sock`)
 
 ### Data format
 
@@ -34,9 +42,9 @@ socket to a serial TTY.  The helper is executed from the fixed path
 socket used by the helper:
 
 ```bash
-export I2C_SOCAT_TTY=/dev/ttyS22            # serial device to bridge
-export I2C_SOCAT_SOCKET=/tmp/ttyS22.tap.sock   # optional, defaults to /tmp/ttyS22.tap.sock
-export I2C_PROXY_SOCK=$I2C_SOCAT_SOCKET     # socket used by the preload library
+# The following exports are optional; the shown values are the defaults.
+export I2C_SOCAT_TTY=/dev/ttyS22
+export I2C_SOCAT_SOCKET=/tmp/ttyS22.tap.sock
 export LD_PRELOAD=$PWD/libi2c_redirect.so
 your_i2c_program
 ```

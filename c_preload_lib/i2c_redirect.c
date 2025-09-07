@@ -340,32 +340,29 @@ static void init_i2c_redirect(void) {
         if (end && *end == '\0' && v >= 0 && v < 1<<30) sock_fd_from_env = (int)v;
     }
     const char *sp = getenv("I2C_PROXY_SOCK");
-    if (sp && *sp) sock_path = strdup(sp);
+    const char *tty = getenv("I2C_SOCAT_TTY");
+    const char *sock = getenv("I2C_SOCAT_SOCKET");
 
     /*
-     * Optional serial redirection: if I2C_SOCAT_TTY is provided spawn a socat
-     * helper that connects a Unix domain socket to the given TTY.  The helper
-     * allows external tools to exchange the same binary frames as the proxy
-     * socket.  We remember the child PID for cleanup.
+     * Apply defaults so callers do not need to set environment variables for
+     * the common configuration.  The serial helper mirrors the defaults used by
+     * the helper scripts: `/dev/ttyS22` for the device and
+     * `/tmp/ttyS22.tap.sock` for the Unix socket.  The proxy socket path follows
+     * the helper's socket when present, otherwise it falls back to the generic
+     * `/tmp/i2c.tap.sock` location.
      */
-    const char *tty = getenv("I2C_SOCAT_TTY");
-    if (tty && *tty) {
-        const char *sock = getenv("I2C_SOCAT_SOCKET");
-        /*
-         * If the helper's socket path isn't specified default to
-         * /tmp/ttyS22.tap.sock so all components agree on a common
-         * location.
-         */
-        if (!sock || !*sock) sock = "/tmp/ttyS22.tap.sock";
+    if (!tty || !*tty) tty = "/dev/ttyS22";
+    if (!sock || !*sock) sock = "/tmp/ttyS22.tap.sock";
+    if (!sp || !*sp) sp = sock;
+    sock_path = strdup(sp);
 
-        /* Remember the paths so the helper can be restarted if it dies. */
-        socat_tty_path = strdup(tty);
-        socat_socket_path = strdup(sock);
+    /* Remember paths so the helper can be restarted if it dies. */
+    socat_tty_path = strdup(tty);
+    socat_socket_path = strdup(sock);
 
-        /* Spawn the initial socat helper.  Later sends will verify that it is
-         * still running and restart it if necessary. */
-        spawn_socat();
-    }
+    /* Spawn the initial socat helper.  Later sends will verify that it is still
+     * running and restart it if necessary. */
+    spawn_socat();
 }
 
 /*

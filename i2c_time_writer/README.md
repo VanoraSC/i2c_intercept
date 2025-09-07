@@ -19,15 +19,14 @@ cargo build --release
 
 ```bash
 LD_PRELOAD=../c_preload_lib/libi2c_redirect.so \
-I2C_SOCAT_TTY=/dev/ttyS22 I2C_SOCAT_SOCKET=/tmp/ttyS22.tap.sock \
-I2C_PROXY_SOCK=/tmp/ttyS22.tap.sock \
 ./target/release/i2c_time_writer /dev/i2c-1 0x50
 ```
 
 The first argument is the path to the I²C device, and the second is the 7-bit
 hexadecimal device address. The preload library spawns a `socat` helper (looked
 up at `/media/data/socat`) to bridge the proxy socket to the serial device
-specified by `I2C_SOCAT_TTY`. Start the `tty_tap_server` in another shell and
-then run the command above. The utility writes the current time every second,
-issues a read for eight bytes and prints the returned counter in decimal when
-received.
+`/dev/ttyS22` and communicates over `/tmp/ttyS22.tap.sock` by default. Override
+`I2C_SOCAT_TTY`, `I2C_SOCAT_SOCKET` or `I2C_PROXY_SOCK` to use different paths.
+Start the `tty_tap_server` in another shell and then run the command above. The
+utility writes the current time every second, issues a read for eight bytes and
+prints the returned counter in decimal when received.

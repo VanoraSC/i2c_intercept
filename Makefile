@@ -1,7 +1,8 @@
 # Top-level Makefile to build all components of the i2c_intercept project.
 #
-# The Makefile orchestrates compilation of the C preload library and the
-# Rust based tools, including the I²C and TTY tap servers and the time writer.
+# The Makefile orchestrates compilation of the C preload library, the static
+# proxy shared library, and the Rust based tools, including the I²C and TTY
+# tap servers, the time writer, and the static proxy test fixture.
 # It also exposes a simple mechanism for cross compiling to aarch64 by setting
 # `ARCH=aarch64`.
 # When cross compiling, an aarch64 cross toolchain and the matching Rust
@@ -45,15 +46,21 @@ CARGO_ENV := CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$(CARGO_TARGET_AARCH6
 endif
 
 # Phony targets prevent conflicts with files of the same name.
-.PHONY: all c_preload_lib i2c_tap_server i2c_time_writer tty_tap_server clean
+
+# Include all buildable components so `make all` compiles the entire project.
+.PHONY: all c_preload_lib c_static_proxy_lib i2c_tap_server i2c_time_writer tty_tap_server static_proxy_fixture clean
 
 # Build everything by default.
-all: c_preload_lib i2c_tap_server i2c_time_writer tty_tap_server
+all: c_preload_lib c_static_proxy_lib i2c_tap_server i2c_time_writer tty_tap_server static_proxy_fixture
 
 # Build the C preload library by invoking its own Makefile and forwarding the
 # CROSS_COMPILE setting so it can also be cross compiled.
 c_preload_lib:
 	$(MAKE) -C c_preload_lib CROSS_COMPILE=$(CROSS_COMPILE)
+
+# Build the C static proxy shared library which exposes a Unix socket bridge.
+c_static_proxy_lib:
+	$(MAKE) -C c_static_proxy_lib CROSS_COMPILE=$(CROSS_COMPILE)
 
 # Build the Rust based tap server.
 i2c_tap_server:
@@ -67,10 +74,17 @@ i2c_time_writer:
 tty_tap_server:
 	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path tty_tap_server/Cargo.toml
 
+# Build the Rust test fixture that exercises the static proxy by writing a
+# fixed payload to an I²C device and reading it back from the socat bridge.
+static_proxy_fixture:
+	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path static_proxy_fixture/Cargo.toml
+
 # Remove build artifacts from all sub projects so the repository returns to a
 # clean state.
 clean:
 	$(MAKE) -C c_preload_lib clean
+	$(MAKE) -C c_static_proxy_lib clean
 	cargo clean --manifest-path i2c_tap_server/Cargo.toml
 	cargo clean --manifest-path i2c_time_writer/Cargo.toml
 	cargo clean --manifest-path tty_tap_server/Cargo.toml
+	cargo clean --manifest-path static_proxy_fixture/Cargo.toml

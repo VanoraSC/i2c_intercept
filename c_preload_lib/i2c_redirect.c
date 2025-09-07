@@ -298,11 +298,14 @@ static void send_all_or_drop(const char *buf, size_t len) {
 
 /* Previous JSON helpers removed: the library now speaks only raw frames. */
 /*
- * Helper for raw mode that sends a binary frame.  The frame format is
- * [addr][cmd][len][data...] where `cmd` is 0 for writes and 1 for reads.  Only
- * the first 255 bytes of the payload are sent since the length is encoded in a
- * single byte.  This mirrors the framing used by the serial tap helpers so the
- * receive side can forward the data without additional parsing.
+ * Helper for raw mode that sends a binary frame.  Frames are formatted as
+ * `[addr][cmd][len][data...]` where `cmd` is `0` for write operations and `1`
+ * for read requests.  The `len` field always encodes the number of payload
+ * bytes; however, read requests carry no payload and the length instead
+ * specifies how many bytes the caller expects to receive in reply.  Only the
+ * first 255 bytes are transmitted because the length is stored in a single
+ * byte.  This mirrors the framing used by the serial tap helpers so the receive
+ * side can forward the data without additional parsing.
  */
 static void emit_raw_frame(int addr, int cmd, const unsigned char *data,
                            size_t len) {
@@ -312,7 +315,12 @@ static void emit_raw_frame(int addr, int cmd, const unsigned char *data,
     hdr[1] = (unsigned char)cmd;
     hdr[2] = (unsigned char)len;
     send_all_or_drop((const char *)hdr, sizeof(hdr));
-    if (len > 0) {
+    /*
+     * Write frames include the payload bytes so the tap server can observe the
+     * exact data sent by the client.  Read frames omit the payload entirely and
+     * rely on the length to convey how many bytes should be returned.
+     */
+    if (cmd == 0 && len > 0 && data) {
         send_all_or_drop((const char *)data, len);
     }
 }

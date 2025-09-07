@@ -21,7 +21,9 @@ your_i2c_program
 ### Data format
 
 The library always emits binary `[addr][cmd][len][data...]` frames. Tools
-consuming the stream must interpret the framing accordingly.
+consuming the stream must interpret the framing accordingly. For read requests
+(`cmd == 1`) no payload bytes follow and `len` conveys the number of bytes the
+caller expects to read in response.
 
 ### Optional serial forwarding via socat
 

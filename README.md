@@ -3,8 +3,8 @@
 This repository contains a collection of tools for intercepting and manipulating I²C traffic.  The project includes:
 
 - **c_preload_lib** – a shared library used to intercept I²C operations via LD_PRELOAD
-- **tty_tap_server** – a Rust server that listens on a serial TTY, logs eight-byte timestamp packets, and echoes them back with a counter
-- **i2c_time_writer** – a Rust utility that inserts timing information into the I²C stream
+- **tty_tap_server** – a Rust server that listens on a serial TTY, logs raw I²C write commands and fulfills read requests with a counter value
+- **i2c_time_writer** – a Rust utility that periodically writes the current time and issues matching read requests
 
 ## Building
 
@@ -72,7 +72,8 @@ I2C_PROXY_SOCK=/tmp/ttyS22.tap.sock \
 ```
 
 The time writer sends the current Unix timestamp once per second as an
-eight-byte little-endian value. The tap server echoes the same bytes back and
-appends an eight-byte counter, which the time writer prints to its standard
-output.
+eight-byte little-endian value and then issues an I²C read command requesting
+eight bytes. The tap server logs the write, records the read request and
+responds with a little-endian counter. The time writer prints the returned
+counter to its standard output.
 

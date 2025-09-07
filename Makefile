@@ -55,18 +55,20 @@ all: c_preload_lib i2c_time_writer tty_tap_server
 c_preload_lib:
 	$(MAKE) -C c_preload_lib CROSS_COMPILE=$(CROSS_COMPILE)
 
-# Build the Rust based tap server.
-# Build the utility that writes time data into the I²C stream.
+# Build the utility that writes time data into the I²C stream.  It compiles
+# a small Rust program that emits the current time across the intercepted
+# I²C bus so the tap server can round-trip it back.
 i2c_time_writer:
-$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path i2c_time_writer/Cargo.toml
+	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path i2c_time_writer/Cargo.toml
 
 # Build the Rust based TTY tap server.
 tty_tap_server:
 	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path tty_tap_server/Cargo.toml
 
 # Remove build artifacts from all sub projects so the repository returns to a
-# clean state.
+# clean state.  This is useful when switching targets or preparing a fresh
+# build.
 clean:
-$(MAKE) -C c_preload_lib clean
-cargo clean --manifest-path i2c_time_writer/Cargo.toml
-cargo clean --manifest-path tty_tap_server/Cargo.toml
+	$(MAKE) -C c_preload_lib clean
+	cargo clean --manifest-path i2c_time_writer/Cargo.toml
+	cargo clean --manifest-path tty_tap_server/Cargo.toml

@@ -2,9 +2,9 @@
  * i2c_redirect.c
  * ---------------
  * LD_PRELOAD library that intercepts common I²C related syscalls and emits
- * JSON descriptions of the traffic to a Unix domain socket.  All intercepted
- * operations are proxied and never reach real hardware, allowing the caller to
- * observe bus traffic without affecting physical devices.
+ * raw binary frames describing the traffic to a Unix domain socket.  All
+ * intercepted operations are proxied and never reach real hardware, allowing
+ * the caller to observe bus traffic without affecting physical devices.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
@@ -59,8 +59,6 @@ static _Thread_local int in_hook = 0;
 static int sock_fd = -1;
 static int sock_fd_from_env = -1;
 static char *sock_path = NULL;
-/* When set, emit binary frames instead of JSON. */
-static int raw_mode = 0;
 
 /*
  * PID of an optional socat helper process.  When I2C_SOCAT_TTY is configured
@@ -111,22 +109,7 @@ static void ensure_resolved(void) {
     real_poll   = dlsym(RTLD_NEXT, "poll");
 }
 
-/* Return current time in nanoseconds. */
-static long long now_ns(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
-}
-
-/* Encode a byte buffer as lower-case hex. */
-static void hex_encode(char *dst, const unsigned char *src, size_t n) {
-    static const char *hex = "0123456789abcdef";
-    for (size_t i = 0; i < n; i++) {
-        dst[2*i]   = hex[(src[i] >> 4) & 0xF];
-        dst[2*i+1] = hex[src[i] & 0xF];
-    }
-    dst[2*n] = '\0';
-}
+/* Removed helpers for time and hex encoding since only raw forwarding remains. */
 
 /* Test if a path looks like an I²C device node. */
 static int is_i2c_path(const char *path) {
@@ -313,28 +296,7 @@ static void send_all_or_drop(const char *buf, size_t len) {
     }
 }
 
-/* Emit a line of JSON, appending a newline if needed. */
-static void emit_json_line(const char *s) {
-    size_t len = strlen(s);
-    if (len && s[len-1] == '\n') {
-        send_all_or_drop(s, len);
-    } else {
-        send_all_or_drop(s, len);
-        send_all_or_drop("\n", 1);
-    }
-}
-
-/* printf-style helper that formats a JSON line and sends it. */
-static void emitf(const char *fmt, ...) __attribute__((format(printf,1,2)));
-static void emitf(const char *fmt, ...) {
-    char buf[65536];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    emit_json_line(buf);
-}
-
+/* Previous JSON helpers removed: the library now speaks only raw frames. */
 /*
  * Helper for raw mode that sends a binary frame.  The frame format is
  * [addr][cmd][len][data...] where `cmd` is 0 for writes and 1 for reads.  Only
@@ -354,84 +316,7 @@ static void emit_raw_frame(int addr, int cmd, const unsigned char *data,
         send_all_or_drop((const char *)data, len);
     }
 }
-
-// --- JSON logging helpers -------------------------------------------------
-/*
- * The original implementation embedded large printf-style JSON format strings
- * directly at each call site.  That made the control flow harder to read and
- * obscured the intent of the surrounding logic.  The helpers below centralize
- * all JSON construction so higher level hooks simply invoke a small function
- * with well named parameters.
- */
-
-/* Emit an \"open\" event describing the file descriptor and path. */
-static void log_open_event(int fd, const char *path) {
-    emitf("{\"type\":\"open\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"path\":\"%s\"}",
-          getpid(), now_ns(), fd, path);
-}
-
-/* Emit a \"close\" event when an I\u00b2C descriptor is closed. */
-static void log_close_event(int fd) {
-    emitf("{\"type\":\"close\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d}",
-          getpid(), now_ns(), fd);
-}
-
-/* Emit a \"write\" event including optional data payload. */
-static void log_write_event(int fd, int addr, size_t len,
-                            const char *data_hex, int truncated) {
-    emitf("{\"type\":\"write\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%d,\"len\":%zu,\"data_hex\":\"%s\"}%s",
-          getpid(), now_ns(), fd, addr, len, data_hex,
-          (truncated ? " /*truncated*/" : ""));
-}
-
-/* Emit header line for an I2C_RDWR ioctl event. */
-static void log_rdwr_start(int fd, int nmsgs, long long ts) {
-    emitf("{\"type\":\"ioctl_rdwr\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"nmsgs\":%d,\"detail\":[",
-          getpid(), ts, fd, nmsgs);
-}
-
-/* Emit a single message element within an I2C_RDWR ioctl event. */
-static void log_rdwr_msg(int idx, const struct i2c_msg *m, int last) {
-    emitf("{\"idx\":%d,\"addr\":%u,\"flags\":%u,\"len\":%u,", idx, m->addr, m->flags, m->len);
-    if (m->flags & I2C_M_RD) {
-        emitf("\"dir\":\"read\"}%s", (last ? "" : ","));
-    } else {
-        size_t take = m->len > 8192 ? 8192 : m->len;
-        char *hex = malloc(take*2 + 1);
-        if (hex) {
-            hex_encode(hex, (const unsigned char*)m->buf, take);
-            emitf("\"dir\":\"write\",\"data_hex\":\"%s\"}%s", hex, (last ? "" : ","));
-            free(hex);
-        } else {
-            emitf("\"dir\":\"write\",\"data_hex\":\"\"}%s", (last ? "" : ","));
-        }
-    }
-}
-
-/* Terminate an I2C_RDWR ioctl event. */
-static void log_rdwr_end(void) {
-    emitf("]}");
-}
-
-/* Emit an event describing a slave address change ioctl. */
-static void log_ioctl_set_slave(int fd, unsigned long addr, int force) {
-    emitf("{\"type\":\"ioctl_set_slave\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"addr\":%lu,\"force\":%s}",
-          getpid(), now_ns(), fd, addr, (force ? "true" : "false"));
-}
-
-/* Emit an event describing a generic SMBus ioctl. */
-static void log_ioctl_smbus(int fd, const struct i2c_smbus_ioctl_data *sd) {
-    emitf("{\"type\":\"ioctl_smbus\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"read\":%s,\"command\":%u,\"size\":%u}",
-          getpid(), now_ns(), fd,
-          (sd->read_write == I2C_SMBUS_READ ? "true" : "false"),
-          sd->command, sd->size);
-}
-
-/* Emit an event for any other ioctl commands that are not specially handled. */
-static void log_ioctl_other(int fd, unsigned long req) {
-    emitf("{\"type\":\"ioctl_other\",\"pid\":%d,\"ts_ns\":%lld,\"fd\":%d,\"req\":%lu}",
-          getpid(), now_ns(), fd, req);
-}
+/* The library now emits only raw frames; previous JSON helpers were removed. */
 
 // --- init
 /* Constructor that initializes environment-derived settings. */
@@ -439,8 +324,6 @@ __attribute__((constructor))
 static void init_i2c_redirect(void) {
     ensure_resolved();
 
-    const char *raw = getenv("I2C_PROXY_RAW");
-    raw_mode = (raw && *raw && strcmp(raw, "0") != 0) ? 1 : 0;
 
     const char *fd_str = getenv("I2C_PROXY_SOCK_FD");
     if (fd_str && *fd_str) {
@@ -454,8 +337,8 @@ static void init_i2c_redirect(void) {
     /*
      * Optional serial redirection: if I2C_SOCAT_TTY is provided spawn a socat
      * helper that connects a Unix domain socket to the given TTY.  The helper
-     * allows external tools to talk to the serial device using the same JSON
-     * protocol as the proxy socket.  We remember the child PID for cleanup.
+     * allows external tools to exchange the same binary frames as the proxy
+     * socket.  We remember the child PID for cleanup.
      */
     const char *tty = getenv("I2C_SOCAT_TTY");
     if (tty && *tty) {
@@ -517,7 +400,6 @@ static int handle_open_common(const char *path, int flags, mode_t *mode_opt, int
     in_hook--;
     if (fd >= 0 && is_i2c_path(path)) {
         mark_i2c_fd(fd, 1);
-        log_open_event(fd, path);
     }
     return fd;
 }
@@ -560,7 +442,6 @@ int openat(int dirfd, const char *path, int flags, ...) {
     in_hook--;
     if (fd >= 0 && is_i2c_path(path)) {
         mark_i2c_fd(fd, 1);
-        log_open_event(fd, path);
     }
     return fd;
 }
@@ -571,7 +452,6 @@ int close(int fd) {
     trace_log("close fd=%d", fd);
     ensure_resolved();
     if (is_marked_i2c(fd)) {
-        log_close_event(fd);
         mark_i2c_fd(fd, 0);
     }
     in_hook++;
@@ -611,42 +491,37 @@ ssize_t read(int fd, void *buf, size_t count) {
         if (sock_fd < 0) ensure_socket();
         if (sock_fd < 0) { r = 0; goto out; }
 
-        if (raw_mode) {
-            /*
-             * In raw mode the proxy delivers binary frames prefixed by a
-             * three byte header.  Serve any previously buffered payload bytes
-             * before attempting to read a new frame from the socket.
-             */
-            if (raw_read_off < raw_read_len) {
-                size_t avail = raw_read_len - raw_read_off;
-                size_t n = (count < avail) ? count : avail;
-                memcpy(buf, raw_read_buf + raw_read_off, n);
-                raw_read_off += n;
-                r = (ssize_t)n;
-                goto out;
-            }
-
-            unsigned char hdr[3];
-            ssize_t n = recv(sock_fd, hdr, 3, 0);
-            if (n <= 0) { r = n; goto out; }
-            size_t len = hdr[2];
-            if (len > sizeof(raw_read_buf)) len = sizeof(raw_read_buf);
-            size_t got = 0;
-            while (got < len) {
-                ssize_t m = recv(sock_fd, raw_read_buf + got, len - got, 0);
-                if (m <= 0) { raw_read_len = raw_read_off = 0; r = m; goto out; }
-                got += m;
-            }
-            raw_read_len = got;
-            raw_read_off = 0;
-            size_t copy = (count < raw_read_len) ? count : raw_read_len;
-            memcpy(buf, raw_read_buf, copy);
-            raw_read_off = copy;
-            r = (ssize_t)copy;
+        /*
+         * The proxy delivers binary frames prefixed by a three byte header.
+         * Serve any previously buffered payload bytes before attempting to read
+         * a new frame from the socket.
+         */
+        if (raw_read_off < raw_read_len) {
+            size_t avail = raw_read_len - raw_read_off;
+            size_t n = (count < avail) ? count : avail;
+            memcpy(buf, raw_read_buf + raw_read_off, n);
+            raw_read_off += n;
+            r = (ssize_t)n;
             goto out;
         }
 
-        r = recv(sock_fd, buf, count, 0);
+        unsigned char hdr[3];
+        ssize_t n = recv(sock_fd, hdr, 3, 0);
+        if (n <= 0) { r = n; goto out; }
+        size_t len = hdr[2];
+        if (len > sizeof(raw_read_buf)) len = sizeof(raw_read_buf);
+        size_t got = 0;
+        while (got < len) {
+            ssize_t m = recv(sock_fd, raw_read_buf + got, len - got, 0);
+            if (m <= 0) { raw_read_len = raw_read_off = 0; r = m; goto out; }
+            got += m;
+        }
+        raw_read_len = got;
+        raw_read_off = 0;
+        size_t copy = (count < raw_read_len) ? count : raw_read_len;
+        memcpy(buf, raw_read_buf, copy);
+        raw_read_off = copy;
+        r = (ssize_t)copy;
         goto out;
     }
 
@@ -707,20 +582,8 @@ ssize_t write(int fd, const void *buf, size_t count) {
         int addr = -1;
         if (fd >= 0 && fd < FD_LIMIT) addr = atomic_load(&current_addr[fd]);
 
-        if (raw_mode) {
-            /* In raw mode forward the payload as a binary frame. */
-            emit_raw_frame(addr, 0, (const unsigned char *)buf, count);
-        } else {
-            /* Otherwise log the transfer as JSON with a hex encoded body. */
-            const size_t max_dump = 8192;
-            size_t n = count > max_dump ? max_dump : count;
-            char *hex = malloc(n * 2 + 1);
-            if (hex) {
-                hex_encode(hex, (const unsigned char *)buf, n);
-                log_write_event(fd, addr, count, hex, (count>max_dump));
-                free(hex);
-            }
-        }
+        /* Forward the payload as a binary frame. */
+        emit_raw_frame(addr, 0, (const unsigned char *)buf, count);
         r = (ssize_t)count;
         goto out;
     }
@@ -735,17 +598,6 @@ out:
 }
 
 // --- ioctl
-/* Emit detailed information for the I2C_RDWR ioctl. */
-static void log_i2c_rdwr(int fd, struct i2c_rdwr_ioctl_data *d) {
-    long long ts = now_ns();
-    log_rdwr_start(fd, (int)d->nmsgs, ts);
-    for (int i = 0; i < (int)d->nmsgs; i++) {
-        struct i2c_msg *m = &d->msgs[i];
-        log_rdwr_msg(i, m, i + 1 >= (int)d->nmsgs);
-    }
-    log_rdwr_end();
-}
-
 /* Main ioctl hook that handles several I²C-specific requests. */
 int ioctl(int fd, unsigned long req, ...) {
     /* Trace ioctl usage including the raw request code. */
@@ -767,7 +619,6 @@ int ioctl(int fd, unsigned long req, ...) {
         unsigned long addr = va_arg(ap, unsigned long);
         va_end(ap);
         if (fd >= 0 && fd < FD_LIMIT) atomic_store(&current_addr[fd], (int)addr);
-        log_ioctl_set_slave(fd, addr, (req==I2C_SLAVE_FORCE));
         /* Always pretend success so client code continues to run. */
         return 0;
     }
@@ -776,17 +627,12 @@ int ioctl(int fd, unsigned long req, ...) {
         struct i2c_rdwr_ioctl_data *d = va_arg(ap, struct i2c_rdwr_ioctl_data *);
         va_end(ap);
         if (d) {
-            if (raw_mode) {
-                /* Send each message as a binary frame to mirror on-the-wire
-                 * traffic. */
-                for (int i = 0; i < (int)d->nmsgs; i++) {
-                    struct i2c_msg *m = &d->msgs[i];
-                    int cmd = (m->flags & I2C_M_RD) ? 1 : 0;
-                    emit_raw_frame(m->addr, cmd,
-                                   (const unsigned char *)m->buf, m->len);
-                }
-            } else {
-                log_i2c_rdwr(fd, d);
+            /* Send each message as a binary frame to mirror on-the-wire traffic. */
+            for (int i = 0; i < (int)d->nmsgs; i++) {
+                struct i2c_msg *m = &d->msgs[i];
+                int cmd = (m->flags & I2C_M_RD) ? 1 : 0;
+                emit_raw_frame(m->addr, cmd,
+                               (const unsigned char *)m->buf, m->len);
             }
         }
         /* The real I/O is suppressed; report success to the caller. */
@@ -796,16 +642,12 @@ int ioctl(int fd, unsigned long req, ...) {
     if (req == I2C_SMBUS) {
         struct i2c_smbus_ioctl_data *sd = va_arg(ap, struct i2c_smbus_ioctl_data *);
         va_end(ap);
-        if (sd) {
-            log_ioctl_smbus(fd, sd);
-        }
+        (void)sd; /* Request acknowledged but no further action taken. */
         return 0;
     }
 
-
     (void)va_arg(ap, void *);
     va_end(ap);
-    log_ioctl_other(fd, req);
     /* Unknown requests on I²C descriptors are acknowledged but not forwarded. */
     return 0;
 }

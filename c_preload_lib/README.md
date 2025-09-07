@@ -18,11 +18,10 @@ export LD_PRELOAD=$PWD/libi2c_redirect.so
 your_i2c_program
 ```
 
-### Raw mode
+### Data format
 
-Set `I2C_PROXY_RAW=1` to emit binary `[addr][cmd][len][data...]` frames instead
-of JSON lines. Tools consuming the stream must also enable raw mode to interpret
-the framing correctly.
+The library always emits binary `[addr][cmd][len][data...]` frames. Tools
+consuming the stream must interpret the framing accordingly.
 
 ### Optional serial forwarding via socat
 

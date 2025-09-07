@@ -45,10 +45,10 @@ CARGO_ENV := CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$(CARGO_TARGET_AARCH6
 endif
 
 # Phony targets prevent conflicts with files of the same name.
-.PHONY: all c_preload_lib i2c_tap_server i2c_time_writer tty_tap_server clean
+.PHONY: all c_preload_lib i2c_time_writer tty_tap_server clean
 
 # Build everything by default.
-all: c_preload_lib i2c_tap_server i2c_time_writer tty_tap_server
+all: c_preload_lib i2c_time_writer tty_tap_server
 
 # Build the C preload library by invoking its own Makefile and forwarding the
 # CROSS_COMPILE setting so it can also be cross compiled.
@@ -56,12 +56,9 @@ c_preload_lib:
 	$(MAKE) -C c_preload_lib CROSS_COMPILE=$(CROSS_COMPILE)
 
 # Build the Rust based tap server.
-i2c_tap_server:
-	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path i2c_tap_server/Cargo.toml
-
 # Build the utility that writes time data into the I²C stream.
 i2c_time_writer:
-	$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path i2c_time_writer/Cargo.toml
+$(CARGO_ENV) cargo build $(CARGO_BUILD_FLAGS) $(CARGO_TARGET_FLAG) --manifest-path i2c_time_writer/Cargo.toml
 
 # Build the Rust based TTY tap server.
 tty_tap_server:
@@ -70,7 +67,6 @@ tty_tap_server:
 # Remove build artifacts from all sub projects so the repository returns to a
 # clean state.
 clean:
-	$(MAKE) -C c_preload_lib clean
-	cargo clean --manifest-path i2c_tap_server/Cargo.toml
-	cargo clean --manifest-path i2c_time_writer/Cargo.toml
-	cargo clean --manifest-path tty_tap_server/Cargo.toml
+$(MAKE) -C c_preload_lib clean
+cargo clean --manifest-path i2c_time_writer/Cargo.toml
+cargo clean --manifest-path tty_tap_server/Cargo.toml

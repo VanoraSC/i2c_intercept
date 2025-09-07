@@ -1,10 +1,10 @@
+use serde_json::Value;
 use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
-use serde_json::Value;
 use tracing::{error, info, trace, warn};
 
 /// Decode a hexadecimal string into a vector of bytes.
@@ -17,7 +17,9 @@ use tracing::{error, info, trace, warn};
 /// dependencies just for hex decoding.
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     trace!("decode_hex len={}", s.len());
-    if s.len() % 2 != 0 { return None; }
+    if s.len() % 2 != 0 {
+        return None;
+    }
     let mut out = Vec::with_capacity(s.len() / 2);
     for i in 0..(s.len() / 2) {
         let byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).ok()?;
@@ -74,12 +76,16 @@ fn main() -> io::Result<()> {
         };
 
         if raw_mode {
-            // In raw mode we operate on binary frames and echo them back
-            // verbatim. Cloning the file descriptor gives us independent reader
-            // and writer handles, allowing replies without disturbing the
-            // buffered reader.
+            // In raw mode the tap server consumes binary `[addr][cmd][len]`
+            // frames.  Instead of simply echoing the bytes back, generate a
+            // response that mirrors the behaviour of the JSON mode: the first
+            // eight payload bytes are echoed and an incrementing counter is
+            // appended.  This allows clients operating in raw mode to verify
+            // that data round-tripped correctly while still working with a
+            // compact binary protocol.
             let mut reader = BufReader::new(file.try_clone()?);
             let mut writer = file;
+            let mut counter: u64 = 0;
             info!("Listening on {:?} (raw)...", path);
             loop {
                 // Each frame begins with a three byte header: address, command
@@ -108,18 +114,32 @@ fn main() -> io::Result<()> {
                 let hex: String = frame.iter().map(|b| format!("{:02x}", b)).collect();
                 info!("Received (raw): {}", hex);
 
-                // Echo the raw frame back to the serial device so that
-                // connected firmware expecting a reply can continue operating.
-                // Flushing the writer immediately ensures the bytes are pushed
-                // out on the wire. Any write error is treated as a lost
-                // connection and triggers a return to the waiting state.
-                if let Err(e) = writer.write_all(&frame) {
-                    error!("Write error: {}", e);
-                    break;
-                }
-                if let Err(e) = writer.flush() {
-                    error!("Flush error: {}", e);
-                    break;
+                if data.len() >= 8 {
+                    // Build the reply frame: preserve the original address and
+                    // command but update the length to account for the appended
+                    // counter.  The response payload contains the timestamp
+                    // echoed back followed by the counter in little-endian
+                    // order.
+                    let mut resp = Vec::with_capacity(3 + 16);
+                    resp.push(hdr[0]);
+                    resp.push(hdr[1]);
+                    resp.push(16); // new payload length
+                    resp.extend_from_slice(&data[..8]);
+                    resp.extend_from_slice(&counter.to_le_bytes());
+
+                    // Write the response frame and flush it immediately so the
+                    // client sees the data without delay.  Any failure causes
+                    // the connection to be reset so the outer loop can
+                    // retry.
+                    if let Err(e) = writer.write_all(&resp) {
+                        error!("Write error: {}", e);
+                        break;
+                    }
+                    if let Err(e) = writer.flush() {
+                        error!("Flush error: {}", e);
+                        break;
+                    }
+                    counter += 1;
                 }
             }
         } else {
@@ -139,10 +159,15 @@ fn main() -> io::Result<()> {
             for line in reader.lines() {
                 let line = match line {
                     Ok(l) => l,
-                    Err(e) => { error!("Read error: {}", e); break; }
+                    Err(e) => {
+                        error!("Read error: {}", e);
+                        break;
+                    }
                 };
                 let trimmed = line.trim();
-                if trimmed.is_empty() { continue; }
+                if trimmed.is_empty() {
+                    continue;
+                }
 
                 match serde_json::from_str::<Value>(trimmed) {
                     Ok(v) => {
@@ -154,13 +179,20 @@ fn main() -> io::Result<()> {
                             if let Some(hex) = v.get("data_hex").and_then(|d| d.as_str()) {
                                 if let Some(bytes) = decode_hex(hex) {
                                     if bytes.len() >= 8 {
-                                        let secs = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+                                        let secs =
+                                            u64::from_le_bytes(bytes[0..8].try_into().unwrap());
                                         info!("Received: {}", secs);
                                         let mut resp = Vec::with_capacity(16);
                                         resp.extend_from_slice(&bytes[0..8]);
                                         resp.extend_from_slice(&counter.to_le_bytes());
-                                        if let Err(e) = writer.write_all(&resp) { error!("Write error: {}", e); break; }
-                                        if let Err(e) = writer.flush() { error!("Flush error: {}", e); break; }
+                                        if let Err(e) = writer.write_all(&resp) {
+                                            error!("Write error: {}", e);
+                                            break;
+                                        }
+                                        if let Err(e) = writer.flush() {
+                                            error!("Flush error: {}", e);
+                                            break;
+                                        }
                                         counter += 1;
                                     } else {
                                         warn!("write event too short");
@@ -174,8 +206,8 @@ fn main() -> io::Result<()> {
                         }
                     }
                     Err(_) => trace!("(raw) {}", trimmed),
+                }
             }
-        }
         }
 
         // If we exit the inner processing loop the peer has closed the

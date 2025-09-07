@@ -29,6 +29,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <pthread.h> /* For pthread_mutex_t used to serialize I/O */
+#include <poll.h>    /* For intercepting poll on virtual I²C descriptors */
 
 #ifndef FD_LIMIT
 #define FD_LIMIT 4096
@@ -49,6 +50,7 @@ static ssize_t (*real_read)(int, void *, size_t) = NULL;
 static ssize_t (*real_write)(int, const void *, size_t) = NULL;
 static int (*real_ioctl)(int, unsigned long, ...) = NULL;
 static int (*real_close)(int) = NULL;
+static int (*real_poll)(struct pollfd *, nfds_t, int) = NULL;
 
 /* Guard to avoid recursively intercepting our own syscalls. */
 static _Thread_local int in_hook = 0;
@@ -85,10 +87,20 @@ static _Atomic int current_addr[FD_LIMIT]; // -1 if unknown
  */
 pthread_mutex_t i2c_io_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * When operating in raw mode the tap server exchanges binary frames that are
+ * prefixed with a three byte header.  The following buffer stores the payload
+ * bytes from the most recently received frame so repeated read() calls can
+ * drain the data without losing the framing information.
+ */
+static unsigned char raw_read_buf[256];
+static size_t raw_read_len = 0;
+static size_t raw_read_off = 0;
+
 /* Resolve the real libc symbol addresses the first time we need them. */
 static void ensure_resolved(void) {
     if (real_open && real_open64 && real_openat && real_read && real_write &&
-        real_ioctl && real_close) return;
+        real_ioctl && real_close && real_poll) return;
     real_open   = dlsym(RTLD_NEXT, "open");
     real_open64 = dlsym(RTLD_NEXT, "open64");
     real_openat = dlsym(RTLD_NEXT, "openat");
@@ -96,6 +108,7 @@ static void ensure_resolved(void) {
     real_write  = dlsym(RTLD_NEXT, "write");
     real_ioctl  = dlsym(RTLD_NEXT, "ioctl");
     real_close  = dlsym(RTLD_NEXT, "close");
+    real_poll   = dlsym(RTLD_NEXT, "poll");
 }
 
 /* Return current time in nanoseconds. */
@@ -598,6 +611,41 @@ ssize_t read(int fd, void *buf, size_t count) {
         if (sock_fd < 0) ensure_socket();
         if (sock_fd < 0) { r = 0; goto out; }
 
+        if (raw_mode) {
+            /*
+             * In raw mode the proxy delivers binary frames prefixed by a
+             * three byte header.  Serve any previously buffered payload bytes
+             * before attempting to read a new frame from the socket.
+             */
+            if (raw_read_off < raw_read_len) {
+                size_t avail = raw_read_len - raw_read_off;
+                size_t n = (count < avail) ? count : avail;
+                memcpy(buf, raw_read_buf + raw_read_off, n);
+                raw_read_off += n;
+                r = (ssize_t)n;
+                goto out;
+            }
+
+            unsigned char hdr[3];
+            ssize_t n = recv(sock_fd, hdr, 3, 0);
+            if (n <= 0) { r = n; goto out; }
+            size_t len = hdr[2];
+            if (len > sizeof(raw_read_buf)) len = sizeof(raw_read_buf);
+            size_t got = 0;
+            while (got < len) {
+                ssize_t m = recv(sock_fd, raw_read_buf + got, len - got, 0);
+                if (m <= 0) { raw_read_len = raw_read_off = 0; r = m; goto out; }
+                got += m;
+            }
+            raw_read_len = got;
+            raw_read_off = 0;
+            size_t copy = (count < raw_read_len) ? count : raw_read_len;
+            memcpy(buf, raw_read_buf, copy);
+            raw_read_off = copy;
+            r = (ssize_t)copy;
+            goto out;
+        }
+
         r = recv(sock_fd, buf, count, 0);
         goto out;
     }
@@ -608,6 +656,38 @@ ssize_t read(int fd, void *buf, size_t count) {
 out:
     pthread_mutex_unlock(&i2c_io_mutex);
     return r;
+}
+
+// --- poll
+/*
+ * Applications often rely on poll() to wait for I²C transactions to
+ * complete.  The descriptors exposed by this library are not backed by real
+ * hardware and therefore never become readable.  This hook redirects poll()
+ * requests to the proxy socket so callers observe readiness once the tap
+ * server has provided a response.
+ */
+int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+    /* Trace poll usage for debugging purposes. */
+    trace_log("poll nfds=%zu timeout=%d", (size_t)nfds, timeout);
+    ensure_resolved();
+    if (in_hook) return real_poll(fds, nfds, timeout);
+
+    for (nfds_t i = 0; i < nfds; i++) {
+        if (is_marked_i2c(fds[i].fd)) {
+            ensure_socat();
+            if (sock_fd < 0) ensure_socket();
+            if (sock_fd < 0) {
+                fds[i].revents = 0;
+                return 0; /* no connection, so no events */
+            }
+            struct pollfd p = { sock_fd, fds[i].events, 0 };
+            int r = real_poll(&p, 1, timeout);
+            fds[i].revents = p.revents;
+            return r;
+        }
+    }
+
+    return real_poll(fds, nfds, timeout);
 }
 
 // --- write

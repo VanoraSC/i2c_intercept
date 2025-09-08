@@ -31,10 +31,12 @@ defaults when they are unset:
 
 ### Data format
 
-The library always emits binary `[addr][cmd][len][data...]` frames. Tools
-consuming the stream must interpret the framing accordingly. For read requests
-(`cmd == 1`) no payload bytes follow and `len` conveys the number of bytes the
-caller expects to read in response.
+The library always emits fixed-size ten-byte frames formatted as
+`[addr][cmd][d0]...[d7]`. The `cmd` byte is `0` for write operations and
+`READ_COMMAND` for read requests. Write frames transmit the eight data bytes
+verbatim so consumers can observe the payload. Read frames ignore the data
+section (which is typically all zeros) and cause the tap server to return a
+62-byte response.
 
 ### Optional serial forwarding via socat
 

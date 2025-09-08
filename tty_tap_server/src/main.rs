@@ -46,9 +46,9 @@ fn drain_stale(file: &mut std::fs::File) -> io::Result<()> {
 /// available. Once opened, it reads binary `[addr][cmd][len][data...]` frames
 /// produced by the preload library. Write commands (`cmd == 0`) are logged in a
 /// human readable hexadecimal representation. Read requests (`cmd == 1`) cause
-/// the server to log the request and send back the current counter value
-/// truncated or padded to the requested length. The counter increments after
-/// every serviced read.
+/// the server to log the request and send back the current counter value padded
+/// with zeros to a fixed length of 62 bytes. The counter increments after every
+/// serviced read.
 fn main() -> io::Result<()> {
     // Initialize tracing so execution can be followed via logs.
     tracing_subscriber::fmt()
@@ -105,25 +105,23 @@ fn main() -> io::Result<()> {
                 let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
                 info!("Write addr=0x{:02x} data={}", addr, hex);
             } else {
-                // Read request: no payload follows. Log the request and reply
-                // with the current counter value truncated or padded to `len`
-                // bytes as required.
+                // Read request: regardless of the requested length, always send
+                // back a 62‑byte payload consisting of the little-endian
+                // counter value padded with zeros. The length byte in the
+                // header is ignored by the receiver so it is fixed to 62 to
+                // reflect the transmitted payload size.
                 info!(
                     "Read addr=0x{:02x} len={} -> counter {}",
                     addr, len, counter
                 );
 
-                let mut resp = Vec::with_capacity(3 + len);
+                let mut resp = Vec::with_capacity(3 + 62);
                 resp.push(addr);
                 resp.push(cmd);
-                resp.push(len as u8);
+                resp.push(62u8);
                 let counter_bytes = counter.to_le_bytes();
-                if len <= 8 {
-                    resp.extend_from_slice(&counter_bytes[..len]);
-                } else {
-                    resp.extend_from_slice(&counter_bytes);
-                    resp.extend(std::iter::repeat(0).take(len - 8));
-                }
+                resp.extend_from_slice(&counter_bytes);
+                resp.extend(std::iter::repeat(0).take(62 - counter_bytes.len()));
 
                 if let Err(e) = writer.write_all(&resp) {
                     error!("Write error: {}", e);

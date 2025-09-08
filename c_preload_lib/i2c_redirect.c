@@ -42,6 +42,11 @@
  */
 #define SOCAT_BINARY "/media/data/socat"
 
+/* I²C command value issued before each read operation.  The tap server ignores
+ * the contents of the trailing bytes but expects this leading opcode to
+ * indicate a read transaction is being requested. */
+#define READ_COMMAND 0x01  /* Opcode used by the tap server for reads */
+
 // --- real syscalls
 static int (*real_open)(const char *, int, ...) = NULL;
 static int (*real_open64)(const char *, int, ...) = NULL;
@@ -85,15 +90,10 @@ static _Atomic int current_addr[FD_LIMIT]; // -1 if unknown
  */
 pthread_mutex_t i2c_io_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/*
- * When operating in raw mode the tap server exchanges binary frames that are
- * prefixed with a three byte header.  The following buffer stores the payload
- * bytes from the most recently received frame so repeated read() calls can
- * drain the data without losing the framing information.
- */
-static unsigned char raw_read_buf[256];
-static size_t raw_read_len = 0;
-static size_t raw_read_off = 0;
+/* The previous implementation buffered framed responses from the tap server.
+ * The protocol has since been simplified so that each read operation expects a
+ * fixed 62‑byte payload without any intermediate buffering.  As a result the
+ * dedicated read buffer is no longer required and has been removed. */
 
 /*
  * Table of I²C addresses that should bypass the redirect logic.  Each index
@@ -532,44 +532,51 @@ ssize_t read(int fd, void *buf, size_t count) {
         if (is_exempt_addr(addr)) {
             in_hook++; r = real_read(fd, buf, count); in_hook--; goto out;
         }
-        /* Pull data from the proxy socket instead of real hardware.  This
-         * mirrors the behavior of the write hook which pushes traffic out on
-         * the same connection.  If no socket is available return EOF so the
-         * caller can retry later. */
+
+        /* All redirected reads are satisfied by the tap server.  Before
+         * requesting data the protocol requires issuing an I²C write command
+         * that conveys the read opcode followed by eight padding bytes.  The
+         * server ignores the padding but expects the command to precede every
+         * read transaction. */
         ensure_socat();
         if (sock_fd < 0) ensure_socket();
         if (sock_fd < 0) { r = 0; goto out; }
 
-        /*
-         * The proxy delivers binary frames prefixed by a three byte header.
-         * Serve any previously buffered payload bytes before attempting to read
-         * a new frame from the socket.
-         */
-        if (raw_read_off < raw_read_len) {
-            size_t avail = raw_read_len - raw_read_off;
-            size_t n = (count < avail) ? count : avail;
-            memcpy(buf, raw_read_buf + raw_read_off, n);
-            raw_read_off += n;
-            r = (ssize_t)n;
-            goto out;
+        unsigned char cmd_buf[10];
+        cmd_buf[0] = (unsigned char)addr;    /* Target address */
+        cmd_buf[1] = READ_COMMAND;           /* Read opcode */
+        memset(cmd_buf + 2, 0, 8);           /* Eight unused bytes */
+        emit_raw_frame(addr, 0, cmd_buf, sizeof(cmd_buf));
+
+        /* Discard the three byte response header.  The tap server no longer
+         * includes a meaningful length field, so the header is read solely to
+         * keep the stream aligned.  A 100ms timeout prevents indefinite
+         * blocking should the server fail to respond. */
+        unsigned char hdr[3];
+        size_t hgot = 0;
+        while (hgot < sizeof(hdr)) {
+            struct pollfd pfd = { sock_fd, POLLIN, 0 };
+            if (poll(&pfd, 1, 100) <= 0) { r = 0; goto out; }
+            ssize_t n = recv(sock_fd, hdr + hgot, sizeof(hdr) - hgot, 0);
+            if (n <= 0) { r = n; goto out; }
+            hgot += (size_t)n;
         }
 
-        unsigned char hdr[3];
-        ssize_t n = recv(sock_fd, hdr, 3, 0);
-        if (n <= 0) { r = n; goto out; }
-        size_t len = hdr[2];
-        if (len > sizeof(raw_read_buf)) len = sizeof(raw_read_buf);
+        /* Read exactly 62 bytes of payload, aborting if the data does not
+         * arrive within 100ms.  Any surplus bytes requested by the caller are
+         * truncated to this fixed payload size. */
+        unsigned char data[62];
         size_t got = 0;
-        while (got < len) {
-            ssize_t m = recv(sock_fd, raw_read_buf + got, len - got, 0);
-            if (m <= 0) { raw_read_len = raw_read_off = 0; r = m; goto out; }
-            got += m;
+        while (got < sizeof(data)) {
+            struct pollfd pfd = { sock_fd, POLLIN, 0 };
+            if (poll(&pfd, 1, 100) <= 0) { r = 0; goto out; }
+            ssize_t n = recv(sock_fd, data + got, sizeof(data) - got, 0);
+            if (n <= 0) { r = n; goto out; }
+            got += (size_t)n;
         }
-        raw_read_len = got;
-        raw_read_off = 0;
-        size_t copy = (count < raw_read_len) ? count : raw_read_len;
-        memcpy(buf, raw_read_buf, copy);
-        raw_read_off = copy;
+
+        size_t copy = (count < sizeof(data)) ? count : sizeof(data);
+        memcpy(buf, data, copy);
         r = (ssize_t)copy;
         goto out;
     }

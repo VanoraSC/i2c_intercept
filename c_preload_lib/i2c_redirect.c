@@ -542,11 +542,26 @@ ssize_t read(int fd, void *buf, size_t count) {
         if (sock_fd < 0) ensure_socket();
         if (sock_fd < 0) { r = 0; goto out; }
 
-        unsigned char cmd_buf[10];
-        cmd_buf[0] = (unsigned char)addr;    /* Target address */
-        cmd_buf[1] = READ_COMMAND;           /* Read opcode */
-        memset(cmd_buf + 2, 0, 8);           /* Eight unused bytes */
+        /*
+         * Issue a preparatory I²C write that conveys the upcoming read
+         * request to the tap server.  The actual wire transaction performed by
+         * hardware would place the slave address on the bus followed by the
+         * read opcode and eight padding bytes.  Our framing already carries the
+         * address in the header, so only the opcode and padding remain in the
+         * payload.  The server ignores the padding but expects this command
+         * before every read.
+         */
+        unsigned char cmd_buf[9];
+        cmd_buf[0] = READ_COMMAND;           /* Read opcode */
+        memset(cmd_buf + 1, 0, 8);           /* Eight unused bytes */
         emit_raw_frame(addr, 0, cmd_buf, sizeof(cmd_buf));
+
+        /*
+         * After the command write, send a read frame so the server knows to
+         * provide data.  The length field is ignored by the server and it always
+         * replies with sixty‑two bytes.
+         */
+        emit_raw_frame(addr, 1, NULL, 62);
 
         /* Discard the three byte response header.  The tap server no longer
          * includes a meaningful length field, so the header is read solely to

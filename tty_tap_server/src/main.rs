@@ -7,6 +7,9 @@ use std::time::Duration;
 use tracing::{error, info};
 use libc::{F_GETFL, F_SETFL, O_NONBLOCK};
 
+/// Command byte sent by the preload library to request a read response.
+const READ_COMMAND: u8 = 0x01;
+
 /// Read and discard any pending bytes from the provided serial device.
 ///
 /// When the tap server reconnects to the proxy TTY there may be leftover
@@ -43,12 +46,12 @@ fn drain_stale(file: &mut std::fs::File) -> io::Result<()> {
 /// Connect to `/dev/ttyS22`, proxy raw I²C frames and maintain a counter.
 ///
 /// The tap server continuously waits for the serial device to become
-/// available. Once opened, it reads binary `[addr][cmd][len][data...]` frames
-/// produced by the preload library. Write commands (`cmd == 0`) are logged in a
-/// human readable hexadecimal representation. Read requests (`cmd == 1`) cause
-/// the server to log the request and send back the current counter value padded
-/// with zeros to a fixed length of 62 bytes. The counter increments after every
-/// serviced read.
+/// available. Once opened, it reads fixed-size ten byte frames formatted as
+/// `[addr][cmd][d0]...[d7]` produced by the preload library. Write commands
+/// (`cmd == 0`) log the eight data bytes in hexadecimal. Read requests
+/// (`cmd == READ_COMMAND`) trigger a response containing a little-endian counter
+/// value padded with zeros to a constant 62-byte length. The counter increments
+/// after each successful read.
 fn main() -> io::Result<()> {
     // Initialize tracing so execution can be followed via logs.
     tracing_subscriber::fmt()
@@ -83,42 +86,25 @@ fn main() -> io::Result<()> {
         info!("Listening on {:?}...", path);
 
         loop {
-            // Each frame begins with a three byte header: address, command and
-            // payload length. Any read failure causes the connection to reset.
-            let mut hdr = [0u8; 3];
-            if let Err(e) = reader.read_exact(&mut hdr) {
+            // Read the fixed 10-byte command frame. Any failure resets the
+            // connection so the server can await a fresh device.
+            let mut frame = [0u8; 10];
+            if let Err(e) = reader.read_exact(&mut frame) {
                 error!("Read error: {}", e);
                 break;
             }
 
-            let addr = hdr[0];
-            let cmd = hdr[1];
-            let len = hdr[2] as usize;
+            let addr = frame[0];
+            let cmd = frame[1];
+            let data = &frame[2..];
 
-            if cmd == 0 {
-                // Write command: read the payload and log it in hexadecimal.
-                let mut data = vec![0u8; len];
-                if let Err(e) = reader.read_exact(&mut data) {
-                    error!("Read error: {}", e);
-                    break;
-                }
-                let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
-                info!("Write addr=0x{:02x} data={}", addr, hex);
-            } else {
-                // Read request: regardless of the requested length, always send
-                // back a 62‑byte payload consisting of the little-endian
-                // counter value padded with zeros. The length byte in the
-                // header is ignored by the receiver so it is fixed to 62 to
-                // reflect the transmitted payload size.
-                info!(
-                    "Read addr=0x{:02x} len={} -> counter {}",
-                    addr, len, counter
-                );
+            if cmd == READ_COMMAND {
+                // Read request: send a 62-byte response containing the
+                // little-endian counter followed by zero padding. The command
+                // frame itself carries no additional information.
+                info!("Read addr=0x{:02x} -> counter {}", addr, counter);
 
-                let mut resp = Vec::with_capacity(3 + 62);
-                resp.push(addr);
-                resp.push(cmd);
-                resp.push(62u8);
+                let mut resp = Vec::with_capacity(62);
                 let counter_bytes = counter.to_le_bytes();
                 resp.extend_from_slice(&counter_bytes);
                 resp.extend(std::iter::repeat(0).take(62 - counter_bytes.len()));
@@ -132,6 +118,11 @@ fn main() -> io::Result<()> {
                     break;
                 }
                 counter += 1;
+            } else {
+                // Write command: log the eight data bytes in hexadecimal so
+                // callers can observe the transmitted payload.
+                let hex: String = data.iter().map(|b| format!("{:02x}", b)).collect();
+                info!("Write addr=0x{:02x} data={}", addr, hex);
             }
         }
 

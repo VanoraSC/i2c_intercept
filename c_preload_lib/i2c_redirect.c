@@ -42,9 +42,11 @@
  */
 #define SOCAT_BINARY "/media/data/socat"
 
-/* I²C command value issued before each read operation.  The tap server ignores
- * the contents of the trailing bytes but expects this leading opcode to
- * indicate a read transaction is being requested. */
+/*
+ * Opcode placed in the second byte of the ten-byte frame to request that the
+ * tap server perform a read and return data. The remaining eight bytes of the
+ * frame are ignored for such requests.
+ */
 #define READ_COMMAND 0x01  /* Opcode used by the tap server for reads */
 
 // --- real syscalls
@@ -337,30 +339,31 @@ static void send_all_or_drop(const char *buf, size_t len) {
 /* Previous JSON helpers removed: the library now speaks only raw frames. */
 /*
  * Helper for raw mode that sends a binary frame.  Frames are formatted as
- * `[addr][cmd][len][data...]` where `cmd` is `0` for write operations and `1`
- * for read requests.  The `len` field always encodes the number of payload
- * bytes; however, read requests carry no payload and the length instead
- * specifies how many bytes the caller expects to receive in reply.  Only the
- * first 255 bytes are transmitted because the length is stored in a single
- * byte.  This mirrors the framing used by the serial tap helpers so the receive
- * side can forward the data without additional parsing.
+ * `[addr][cmd][d0]...[d7]` and therefore always occupy ten bytes.  The `cmd`
+ * byte conveys whether the payload represents a write (0) or a read request
+ * (`READ_COMMAND`).  All eight payload bytes are transmitted for writes so the
+ * tap server can observe the original data.  Read requests ignore the payload
+ * contents entirely and are typically filled with zeros.  Payloads shorter than
+ * eight bytes are padded with zeros while longer payloads are truncated to keep
+ * the frame size fixed.
  */
 static void emit_raw_frame(int addr, int cmd, const unsigned char *data,
                            size_t len) {
-    unsigned char hdr[3];
-    if (len > 255) len = 255;
-    hdr[0] = (unsigned char)addr;
-    hdr[1] = (unsigned char)cmd;
-    hdr[2] = (unsigned char)len;
-    send_all_or_drop((const char *)hdr, sizeof(hdr));
-    /*
-     * Write frames include the payload bytes so the tap server can observe the
-     * exact data sent by the client.  Read frames omit the payload entirely and
-     * rely on the length to convey how many bytes should be returned.
-     */
-    if (cmd == 0 && len > 0 && data) {
-        send_all_or_drop((const char *)data, len);
+    unsigned char frame[10];
+    frame[0] = (unsigned char)addr;      /* Target I²C address */
+    frame[1] = (unsigned char)cmd;       /* Operation code */
+
+    /* Copy up to eight data bytes and pad the remainder with zeros. */
+    size_t copy = (len > 8) ? 8 : len;
+    if (copy > 0 && data) {
+        memcpy(&frame[2], data, copy);
     }
+    if (copy < 8) {
+        memset(&frame[2 + copy], 0, 8 - copy);
+    }
+
+    /* Send the fixed-length frame to the tap server. */
+    send_all_or_drop((const char *)frame, sizeof(frame));
 }
 /* The library now emits only raw frames; previous JSON helpers were removed. */
 
@@ -533,49 +536,19 @@ ssize_t read(int fd, void *buf, size_t count) {
             in_hook++; r = real_read(fd, buf, count); in_hook--; goto out;
         }
 
-        /* All redirected reads are satisfied by the tap server.  Before
-         * requesting data the protocol requires issuing an I²C write command
-         * that conveys the read opcode followed by eight padding bytes.  The
-         * server ignores the padding but expects the command to precede every
-         * read transaction. */
+        /* All redirected reads are satisfied by the tap server.  The new
+         * protocol conveys a read request using a single 10‑byte frame that
+         * contains the target address, the read command opcode and eight bytes
+         * of padding.  Once this frame is sent the server replies directly with
+         * a fixed 62‑byte payload. */
         ensure_socat();
         if (sock_fd < 0) ensure_socket();
         if (sock_fd < 0) { r = 0; goto out; }
 
-        /*
-         * Issue a preparatory I²C write that conveys the upcoming read
-         * request to the tap server.  The actual wire transaction performed by
-         * hardware would place the slave address on the bus followed by the
-         * read opcode and eight padding bytes.  Our framing already carries the
-         * address in the header, so only the opcode and padding remain in the
-         * payload.  The server ignores the padding but expects this command
-         * before every read.
-         */
-        unsigned char cmd_buf[9];
-        cmd_buf[0] = READ_COMMAND;           /* Read opcode */
-        memset(cmd_buf + 1, 0, 8);           /* Eight unused bytes */
-        emit_raw_frame(addr, 0, cmd_buf, sizeof(cmd_buf));
-
-        /*
-         * After the command write, send a read frame so the server knows to
-         * provide data.  The length field is ignored by the server and it always
-         * replies with sixty‑two bytes.
-         */
-        emit_raw_frame(addr, 1, NULL, 62);
-
-        /* Discard the three byte response header.  The tap server no longer
-         * includes a meaningful length field, so the header is read solely to
-         * keep the stream aligned.  A 100ms timeout prevents indefinite
-         * blocking should the server fail to respond. */
-        unsigned char hdr[3];
-        size_t hgot = 0;
-        while (hgot < sizeof(hdr)) {
-            struct pollfd pfd = { sock_fd, POLLIN, 0 };
-            if (poll(&pfd, 1, 100) <= 0) { r = 0; goto out; }
-            ssize_t n = recv(sock_fd, hdr + hgot, sizeof(hdr) - hgot, 0);
-            if (n <= 0) { r = n; goto out; }
-            hgot += (size_t)n;
-        }
+        /* Emit the read command frame.  The payload carries no useful data but
+         * is padded with zeros to satisfy the fixed frame size. */
+        unsigned char pad[8] = {0};
+        emit_raw_frame(addr, READ_COMMAND, pad, sizeof(pad));
 
         /* Read exactly 62 bytes of payload, aborting if the data does not
          * arrive within 100ms.  Any surplus bytes requested by the caller are

@@ -75,8 +75,8 @@ LD_PRELOAD=./c_preload_lib/libi2c_redirect.so \
 
 The time writer sends the current Unix timestamp once per second as an
 eight-byte little-endian value and then issues an I²C read command requesting
-eight bytes. The tap server logs the write, records the read request and
-responds with a little-endian counter. The time writer prints the returned
-counter to its standard output. Override `I2C_SOCAT_TTY`,
+sixty-two bytes. The tap server logs the write, records the read request and
+responds with a little-endian counter padded with zeros. The time writer prints
+the returned counter to its standard output. Override `I2C_SOCAT_TTY`,
 `I2C_SOCAT_SOCKET` or `I2C_PROXY_SOCK` if different paths are needed.
 

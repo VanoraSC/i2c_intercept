@@ -9,7 +9,7 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::Duration;
 
-use tty_tap_server::start_echo_server;
+use crate::server_handle::start_echo_server;
 
 /// Helper used to repeatedly attempt connections while the server thread is
 /// starting.
